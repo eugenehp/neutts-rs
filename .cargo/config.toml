@@ -1,0 +1,11 @@
+# ── macOS deployment target ────────────────────────────────────────────────────
+# The pre-built ONNX Runtime binary bundled by `ort` (ORT 1.23.2 / ms@1.23.2)
+# targets macOS 13.4.  Setting MACOSX_DEPLOYMENT_TARGET here to match silences
+# the "was built for newer macOS version" linker warnings for both libort and
+# the espeak-ng objects we compile from source.
+#
+# macOS 13 (Ventura) covers all Apple Silicon Macs and all Intel Macs shipped
+# after 2017, so this is a safe minimum for a desktop TTS library.
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.4"
