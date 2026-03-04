@@ -1,11 +1,11 @@
 [package]
 name = "neutts"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
-authors = ["NeuTTS-RS Contributors"]
+authors = ["Eugene Hauptmann"]
 description = "Rust port of NeuTTS — on-device voice-cloning TTS with GGUF backbone and NeuCodec decoder"
-repository = "https://github.com/neuphonic/neutts-rs"
-homepage = "https://github.com/neuphonic/neutts-rs"
+repository = "https://github.com/eugenehp/neutts-rs"
+homepage = "https://github.com/eugenehp/neutts-rs"
 keywords = ["tts", "text-to-speech", "voice-cloning", "gguf", "speech-synthesis"]
 license = "MIT"
 
