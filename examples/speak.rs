@@ -38,6 +38,17 @@
 //!   --ref-text  "What I said." \
 //!   --text      "Hello." \
 //!   --backbone  neuphonic/neutts-air-q4-gguf
+//!
+//! # List all GGUF variants in a repo, then pick one
+//! cargo run --example speak --features espeak -- \
+//!   --backbone neuphonic/neutts-nano-q4-gguf --list-files
+//!
+//! cargo run --example speak --features espeak -- \
+//!   --wav      my_voice.wav \
+//!   --ref-text "What I said." \
+//!   --text     "Hello." \
+//!   --backbone neuphonic/neutts-nano-q4-gguf \
+//!   --gguf-file neutts-nano-Q4_K_M.gguf
 //! ```
 //!
 //! ## First-run encoding
@@ -72,25 +83,61 @@ fn main() -> anyhow::Result<()> {
     let mut wav_path:     Option<PathBuf> = None;
     let mut codes_path:   Option<PathBuf> = None;
     let mut ref_text_arg: Option<String>  = None;
-    let mut text = String::new();
-    let mut out  = PathBuf::from("output.wav");
-    let mut backbone = "neuphonic/neutts-nano-q4-gguf".to_string();
+    let mut text      = String::new();
+    let mut out       = PathBuf::from("output.wav");
+    let mut backbone  = "neuphonic/neutts-nano-q4-gguf".to_string();
+    let mut gguf_file: Option<String>    = None;
+    let mut list_files  = false;
+    let mut list_models = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--wav"      | "-w" => wav_path     = args.next().map(PathBuf::from),
-            "--codes"    | "-c" => codes_path   = args.next().map(PathBuf::from),
-            "--ref-text" | "-r" => ref_text_arg = args.next(),
-            "--text"     | "-t" => text         = args.next().unwrap_or_default(),
-            "--out"      | "-o" => out          = args.next().map(PathBuf::from).unwrap_or(out),
-            "--backbone" | "-b" => backbone     = args.next().unwrap_or(backbone),
-            "--help"     | "-h" => { print_help(); return Ok(()); }
+            "--wav"         | "-w" => wav_path     = args.next().map(PathBuf::from),
+            "--codes"       | "-c" => codes_path   = args.next().map(PathBuf::from),
+            "--ref-text"    | "-r" => ref_text_arg = args.next(),
+            "--text"        | "-t" => text         = args.next().unwrap_or_default(),
+            "--out"         | "-o" => out          = args.next().map(PathBuf::from).unwrap_or(out),
+            "--backbone"    | "-b" => backbone     = args.next().unwrap_or(backbone),
+            "--gguf-file"   | "-g" => gguf_file    = args.next(),
+            "--list-files"         => list_files   = true,
+            "--list-models"        => list_models  = true,
+            "--help"        | "-h" => { print_help(); return Ok(()); }
             other => {
                 eprintln!("Unknown argument: {other}");
                 eprintln!("Run with --help for usage.");
                 std::process::exit(1);
             }
         }
+    }
+
+    // ── --list-models: print known model table and exit ───────────────────────
+    if list_models {
+        neutts::download::print_model_table();
+        return Ok(());
+    }
+
+    // ── --list-files: show GGUF files in the chosen repo and exit ─────────────
+    if list_files {
+        // Annotate with registry info if known.
+        if let Some(info) = neutts::download::find_model(&backbone) {
+            println!("Backbone : {} — {} ({}, {})",
+                info.repo, info.name, info.language, info.params);
+        } else {
+            println!("Backbone : {backbone}  (unknown repo)");
+        }
+        println!("Available GGUF files:");
+        match neutts::download::list_gguf_files(&backbone) {
+            Ok(files) if files.is_empty() =>
+                println!("  (none — this repo may use a different format)"),
+            Ok(files) => files.iter().for_each(|f| println!("  {f}")),
+            Err(e) => eprintln!("  Error fetching file list: {e}"),
+        }
+        println!();
+        println!("Use with:  --gguf-file <filename>");
+        println!("Example:");
+        println!("  cargo run --example speak --features espeak -- \\");
+        println!("    --backbone {backbone} --gguf-file <filename> ...");
+        return Ok(());
     }
 
     // ── Validate ──────────────────────────────────────────────────────────────
@@ -178,7 +225,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Load models ───────────────────────────────────────────────────────────
     println!("Loading models…");
-    let tts = neutts::download::load_from_hub_cb(&backbone, |p| {
+    let tts = neutts::download::load_from_hub_cb(&backbone, gguf_file.as_deref(), |p| {
         use neutts::download::LoadProgress;
         match &p {
             LoadProgress::Fetching { step, total, file, repo } =>
@@ -428,9 +475,13 @@ fn print_help() {
          \n\
          OPTIONS:\n\
          \t--out      / -o PATH   Output WAV  (default: output.wav)\n\
-         \t--backbone / -b REPO   HuggingFace backbone\n\
-         \t                       (default: neuphonic/neutts-nano-q4-gguf)\n\
-         \t--help     / -h        Show this help\n\
+         \t--backbone   / -b REPO  HuggingFace backbone repo\n\
+         \t                        (default: neuphonic/neutts-nano-q4-gguf)\n\
+         \t--gguf-file  / -g FILE  Specific GGUF filename within the repo.\n\
+         \t                        Omit to use the first .gguf found.\n\
+         \t--list-files            Print all .gguf files in --backbone and exit.\n\
+         \t--list-models           Print table of all known backbone repos and exit.\n\
+         \t--help       / -h       Show this help\n\
          \n\
          FIRST-RUN ENCODING:\n\
          \tPython 3 + neucodec are used to encode the WAV on first run.\n\

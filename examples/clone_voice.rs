@@ -179,6 +179,7 @@ fn main() -> anyhow::Result<()> {
 
     let tts = neutts::download::load_from_hub_cb(
         &backbone_repo,
+        None,
         |p| print_progress(&p),
     )?;
     println!("  → decoder backend : {}", tts.codec.backend_name());

@@ -31,18 +31,56 @@ use hf_hub::api::sync::Api;
 use crate::model::NeuTTS;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Language-code map (mirrors Python BACKBONE_LANGUAGE_MAP)
+// Model registry
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Map from backbone HuggingFace repo ID → espeak-ng language code.
-#[cfg(feature = "backbone")]
+/// Metadata for a single backbone repository.
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    /// HuggingFace repo ID, e.g. `"neuphonic/neutts-nano-q4-gguf"`.
+    pub repo: &'static str,
+    /// Human-readable model name.
+    pub name: &'static str,
+    /// espeak-ng language code for phonemisation.
+    pub language: &'static str,
+    /// Approximate parameter count.
+    pub params: &'static str,
+    /// Whether the repo contains pre-quantised GGUF files.
+    pub is_gguf: bool,
+}
+
+/// All known NeuTTS backbone repositories, ordered by language then size.
+pub const BACKBONE_MODELS: &[ModelInfo] = &[
+    // ── English ───────────────────────────────────────────────────────────────
+    ModelInfo { repo: "neuphonic/neutts-nano-q4-gguf", name: "NeuTTS Nano Q4",      language: "en-us", params: "0.2B", is_gguf: true  },
+    ModelInfo { repo: "neuphonic/neutts-nano-q8-gguf", name: "NeuTTS Nano Q8",      language: "en-us", params: "0.2B", is_gguf: true  },
+    ModelInfo { repo: "neuphonic/neutts-nano",         name: "NeuTTS Nano (full)",  language: "en-us", params: "0.2B", is_gguf: false },
+    ModelInfo { repo: "neuphonic/neutts-air-q4-gguf",  name: "NeuTTS Air Q4",       language: "en-us", params: "0.7B", is_gguf: true  },
+    ModelInfo { repo: "neuphonic/neutts-air-q8-gguf",  name: "NeuTTS Air Q8",       language: "en-us", params: "0.7B", is_gguf: true  },
+    ModelInfo { repo: "neuphonic/neutts-air",          name: "NeuTTS Air (full)",   language: "en-us", params: "0.7B", is_gguf: false },
+    // ── German ────────────────────────────────────────────────────────────────
+    ModelInfo { repo: "neuphonic/neutts-nano-german-q4-gguf", name: "NeuTTS Nano German Q4",     language: "de", params: "0.2B", is_gguf: true  },
+    ModelInfo { repo: "neuphonic/neutts-nano-german-q8-gguf", name: "NeuTTS Nano German Q8",     language: "de", params: "0.2B", is_gguf: true  },
+    ModelInfo { repo: "neuphonic/neutts-nano-german",         name: "NeuTTS Nano German (full)", language: "de", params: "0.2B", is_gguf: false },
+    // ── French ────────────────────────────────────────────────────────────────
+    ModelInfo { repo: "neuphonic/neutts-nano-french-q4-gguf", name: "NeuTTS Nano French Q4",     language: "fr-fr", params: "0.2B", is_gguf: true  },
+    ModelInfo { repo: "neuphonic/neutts-nano-french-q8-gguf", name: "NeuTTS Nano French Q8",     language: "fr-fr", params: "0.2B", is_gguf: true  },
+    ModelInfo { repo: "neuphonic/neutts-nano-french",         name: "NeuTTS Nano French (full)", language: "fr-fr", params: "0.2B", is_gguf: false },
+    // ── Spanish ───────────────────────────────────────────────────────────────
+    ModelInfo { repo: "neuphonic/neutts-nano-spanish-q4-gguf", name: "NeuTTS Nano Spanish Q4",     language: "es", params: "0.2B", is_gguf: true  },
+    ModelInfo { repo: "neuphonic/neutts-nano-spanish-q8-gguf", name: "NeuTTS Nano Spanish Q8",     language: "es", params: "0.2B", is_gguf: true  },
+    ModelInfo { repo: "neuphonic/neutts-nano-spanish",          name: "NeuTTS Nano Spanish (full)", language: "es", params: "0.2B", is_gguf: false },
+];
+
+/// Look up a [`ModelInfo`] by repo ID.  Returns `None` for unknown repos.
+pub fn find_model(repo: &str) -> Option<&'static ModelInfo> {
+    BACKBONE_MODELS.iter().find(|m| m.repo == repo)
+}
+
+/// espeak-ng language code for a backbone repo.
+/// Falls back to `"en-us"` for unknown repos.
 fn backbone_language(repo: &str) -> &'static str {
-    match repo {
-        r if r.contains("german")  => "de",
-        r if r.contains("french")  => "fr-fr",
-        r if r.contains("spanish") => "es",
-        _                          => "en-us",
-    }
+    find_model(repo).map(|m| m.language).unwrap_or("en-us")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,10 +156,14 @@ fn hf_download_by_extension(
 ///
 /// * `backbone_repo` — HuggingFace repo for the GGUF backbone, e.g.
 ///   `"neuphonic/neutts-nano-q4-gguf"`.
+/// * `gguf_file`     — Specific filename within the repo to download, e.g.
+///   `Some("neutts-nano-Q4_K_M.gguf")`.  `None` picks the first `.gguf`
+///   found in the repo (original behaviour).
 /// * `on_progress`   — Progress callback; see [`LoadProgress`].
 #[cfg(feature = "backbone")]
 pub fn load_from_hub_cb<F>(
     backbone_repo: &str,
+    gguf_file: Option<&str>,
     mut on_progress: F,
 ) -> Result<NeuTTS>
 where
@@ -130,13 +172,25 @@ where
     let api = Api::new().context("Failed to initialise HuggingFace Hub client")?;
 
     // ── 1. Download GGUF backbone ─────────────────────────────────────────────
+    let file_label = gguf_file.unwrap_or("*.gguf").to_string();
     on_progress(LoadProgress::Fetching {
         step: 1, total: 2,
-        file: "*.gguf".into(),
+        file: file_label,
         repo: backbone_repo.into(),
     });
-    let backbone_path = hf_download_by_extension(&api, backbone_repo, &[".gguf"])
-        .with_context(|| format!("Failed to download GGUF from '{backbone_repo}'"))?;
+    let backbone_path = match gguf_file {
+        Some(fname) => hf_download(&api, backbone_repo, fname)
+            .with_context(|| {
+                format!("Failed to download '{fname}' from '{backbone_repo}'.\n\
+                         \n\
+                         List available files with:\n\
+                         \n\
+                         \tcargo run --example speak -- \
+                         --backbone {backbone_repo} --list-files")
+            })?,
+        None => hf_download_by_extension(&api, backbone_repo, &[".gguf"])
+            .with_context(|| format!("Failed to download GGUF from '{backbone_repo}'"))?,
+    };
 
     // ── 2. Load backbone (Burn codec is compiled in) ──────────────────────────
     on_progress(LoadProgress::Loading {
@@ -149,12 +203,24 @@ where
 /// Download and load a [`NeuTTS`] model from HuggingFace Hub.
 ///
 /// Convenience wrapper around [`load_from_hub_cb`] with a no-op progress
-/// callback.  Use [`load_from_hub_cb`] for progress reporting.
+/// callback and automatic GGUF file selection.
+/// Use [`load_from_hub_cb`] to specify a particular GGUF file or for progress
+/// reporting.
 ///
 /// **Requires the `backbone` Cargo feature.**
 #[cfg(feature = "backbone")]
 pub fn load_from_hub(backbone_repo: &str) -> Result<NeuTTS> {
-    load_from_hub_cb(backbone_repo, |_| {})
+    load_from_hub_cb(backbone_repo, None, |_| {})
+}
+
+/// List all `.gguf` files available in a HuggingFace backbone repository.
+///
+/// Useful for discovering which quantisation variants are available before
+/// calling [`load_from_hub_cb`] with a specific `gguf_file`.
+pub fn list_gguf_files(backbone_repo: &str) -> Result<Vec<String>> {
+    let api = Api::new().context("Failed to initialise HuggingFace Hub client")?;
+    let files = hf_list_files(&api, backbone_repo)?;
+    Ok(files.into_iter().filter(|f| f.ends_with(".gguf")).collect())
 }
 
 /// Load the default NeuTTS-Nano Q4 model.
@@ -271,23 +337,17 @@ pub fn load_encoder(source: &str) -> Result<crate::codec::NeuCodecEncoder> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Supported backbone repos list
+// Supported repo helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Return all officially supported backbone repository IDs.
+/// All supported backbone repo IDs (derived from [`BACKBONE_MODELS`]).
 pub fn supported_backbone_repos() -> Vec<&'static str> {
-    vec![
-        "neuphonic/neutts-air-q4-gguf",
-        "neuphonic/neutts-air-q8-gguf",
-        "neuphonic/neutts-nano-q4-gguf",
-        "neuphonic/neutts-nano-q8-gguf",
-        "neuphonic/neutts-nano-german-q4-gguf",
-        "neuphonic/neutts-nano-german-q8-gguf",
-        "neuphonic/neutts-nano-french-q4-gguf",
-        "neuphonic/neutts-nano-french-q8-gguf",
-        "neuphonic/neutts-nano-spanish-q4-gguf",
-        "neuphonic/neutts-nano-spanish-q8-gguf",
-    ]
+    BACKBONE_MODELS.iter().map(|m| m.repo).collect()
+}
+
+/// All GGUF-only backbone repo IDs.
+pub fn supported_gguf_repos() -> Vec<&'static str> {
+    BACKBONE_MODELS.iter().filter(|m| m.is_gguf).map(|m| m.repo).collect()
 }
 
 /// Return the officially supported codec decoder repository ID.
@@ -298,4 +358,22 @@ pub fn supported_codec_decoder_repo() -> &'static str {
 /// Return the officially supported codec encoder repository ID.
 pub fn supported_codec_encoder_repo() -> &'static str {
     "neuphonic/neucodec-onnx-encoder"
+}
+
+/// Print a formatted table of all known backbone models to stdout.
+///
+/// ```text
+/// repo                                  name                      lang    params  gguf
+/// neuphonic/neutts-nano-q4-gguf         NeuTTS Nano Q4            en-us   0.2B    yes
+/// …
+/// ```
+pub fn print_model_table() {
+    println!("{:<45} {:<28} {:<7} {:<6} {}",
+        "repo", "name", "lang", "params", "gguf");
+    println!("{}", "-".repeat(95));
+    for m in BACKBONE_MODELS {
+        println!("{:<45} {:<28} {:<7} {:<6} {}",
+            m.repo, m.name, m.language, m.params,
+            if m.is_gguf { "yes" } else { "no" });
+    }
 }

@@ -111,7 +111,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Download / load models ────────────────────────────────────────────────
     println!("Loading models…");
-    let tts = neutts::download::load_from_hub_cb(&backbone, |p| {
+    let tts = neutts::download::load_from_hub_cb(&backbone, None, |p| {
         use neutts::download::LoadProgress;
         match &p {
             LoadProgress::Fetching { step, total, file, repo } =>

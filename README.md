@@ -31,8 +31,8 @@ pip install torch huggingface_hub safetensors
 python scripts/convert_weights.py
 ```
 
-Downloads `neuphonic/neucodec/pytorch_model.bin`, extracts the decoder weights,
-and saves them as `models/neucodec_decoder.safetensors`.
+Downloads `neuphonic/neucodec`, extracts the decoder weights, and saves them as
+`models/neucodec_decoder.safetensors`.
 
 ### 3. Build
 
@@ -40,31 +40,25 @@ and saves them as `models/neucodec_decoder.safetensors`.
 cargo build --features espeak
 ```
 
-### 4. Encode a reference voice
+### 4. Clone a voice and synthesise
 
-Encoding is not yet implemented in pure Rust (it requires the heavy Wav2Vec2Bert
-semantic model).  Use Python once per reference speaker:
+The simplest path — point at any WAV file and say what you want:
 
 ```sh
-pip install neucodec torchaudio numpy
-python -c "
-from neucodec import NeuCodec
-import numpy as np, torchaudio
-model = NeuCodec.from_pretrained('neuphonic/neucodec')
-y, sr = torchaudio.load('reference.wav')
-codes = model.encode_code(y)
-np.save('ref.npy', codes.numpy().astype('int32'))
-print(f'{len(codes[0])} tokens saved')
-"
+cargo run --example speak --features espeak -- \
+  --wav      my_voice.wav \
+  --ref-text "Exactly what I said in the recording." \
+  --text     "Hello, this is my cloned voice."
 ```
 
-### 5. Synthesise
+On the first run the reference WAV is encoded via the Python `neucodec` package
+and cached as `my_voice.npy` beside the WAV.  Every subsequent run loads the
+cache and skips encoding entirely.
+
+**One-time Python install for encoding:**
 
 ```sh
-cargo run --example basic --features espeak -- \
-  --ref-codes ref.npy \
-  --ref-text  "Transcript of your reference recording." \
-  --text      "Hello, this is your cloned voice speaking."
+pip install neucodec huggingface_hub torchaudio
 ```
 
 ---
@@ -73,24 +67,154 @@ cargo run --example basic --features espeak -- \
 
 | Example | What it does |
 |---------|-------------|
-| `test_pipeline` | Smoke-test every pipeline component that works without model files |
+| `speak` | **Recommended.** WAV in → synthesised audio out. Encodes on first run, caches `.npy` beside the WAV. Supports `--list-models`, `--list-files`, `--gguf-file`. |
 | `basic` | Synthesise from a pre-encoded `.npy` reference |
-| `clone_voice` | Full voice cloning — pre-encoded `.npy` or raw WAV + auto SHA-256 cache |
+| `clone_voice` | Full voice cloning — `.npy` or raw WAV + SHA-256 cache |
 | `encode_reference` | Stub — returns a helpful error; use Python for now |
-| `download_models` | Download / stage weights (updated for safetensors workflow) |
+| `download_models` | Download / stage weights |
+| `test_pipeline` | Smoke-test every component without model files |
+
+### speak
 
 ```sh
-# No models needed
-cargo run --example test_pipeline --no-default-features
+# Minimal — encodes reference on first run, cached after that
+cargo run --example speak --features espeak -- \
+  --wav      my_voice.wav \
+  --ref-text "What I said in the recording." \
+  --text     "Hello, this is my cloned voice."
 
-# Synthesis
+# Use a bundled sample voice (pre-encoded, no Python needed)
+cargo run --example speak --features espeak -- \
+  --wav      samples/jo.wav \
+  --ref-text samples/jo.txt \
+  --text     "Hello from Jo."
+
+# Skip directly to a pre-encoded .npy
+cargo run --example speak --features espeak -- \
+  --codes    samples/dave.npy \
+  --ref-text samples/dave.txt \
+  --text     "Hello from Dave."
+
+# List all known backbone models
+cargo run --example speak --features espeak -- --list-models
+
+# List GGUF files available in a specific repo
+cargo run --example speak --features espeak -- \
+  --backbone neuphonic/neutts-nano-q4-gguf --list-files
+
+# Pick a specific GGUF quantisation
+cargo run --example speak --features espeak -- \
+  --wav       my_voice.wav \
+  --ref-text  "What I said." \
+  --text      "Hello." \
+  --backbone  neuphonic/neutts-nano-q4-gguf \
+  --gguf-file neutts-nano-Q4_K_M.gguf
+
+# Different language backbone
+cargo run --example speak --features espeak -- \
+  --backbone neuphonic/neutts-nano-german-q4-gguf \
+  --wav      samples/greta.wav \
+  --ref-text samples/greta.txt \
+  --text     "Hallo aus Rust."
+
+# CPU-only (no wgpu)
+cargo run --example speak --no-default-features --features espeak -- \
+  --wav my_voice.wav --ref-text "..." --text "Hello."
+```
+
+**speak flags:**
+
+| Flag | Short | Purpose |
+|------|-------|---------|
+| `--wav PATH` | `-w` | WAV file of the voice to clone |
+| `--codes PATH` | `-c` | Pre-encoded `.npy` (skips encoding) |
+| `--ref-text TEXT\|PATH` | `-r` | Transcript of the reference WAV (file or literal string). Auto-detected from `<stem>.txt` if omitted. |
+| `--text TEXT` | `-t` | Text to synthesise |
+| `--out PATH` | `-o` | Output WAV (default: `output.wav`) |
+| `--backbone REPO` | `-b` | HuggingFace backbone repo (see `--list-models`) |
+| `--gguf-file FILE` | `-g` | Specific `.gguf` filename within the repo |
+| `--list-files` | | Print all `.gguf` files in `--backbone` and exit |
+| `--list-models` | | Print table of all known backbone repos and exit |
+
+### basic
+
+```sh
+# Default: NeuTTS-Nano Q4, bundled Jo voice
 cargo run --example basic --features espeak
 
-# Voice cloning with cache
+# Custom text and reference
+cargo run --example basic --features espeak -- \
+  --text      "The quick brown fox." \
+  --ref-codes samples/jo.npy \
+  --ref-text  samples/jo.txt
+
+# Different backbone
+cargo run --example basic --features espeak -- \
+  --backbone neuphonic/neutts-air-q4-gguf
+```
+
+### clone_voice
+
+```sh
+# First run: encodes + SHA-256 caches
+cargo run --example clone_voice --features espeak -- \
+  --ref-audio samples/jo.wav \
+  --text      "Hello."
+
+# Second run: cache hit, encoder skipped
+cargo run --example clone_voice --features espeak -- \
+  --ref-audio samples/jo.wav \
+  --text      "Different text."
+
+# Pre-encoded .npy
 cargo run --example clone_voice --features espeak -- \
   --ref-codes samples/jo.npy \
   --ref-text  samples/jo.txt \
-  --text      "Hello from Rust."
+  --text      "Hello."
+```
+
+---
+
+## Available models
+
+Run `--list-models` to see the full table at any time:
+
+```sh
+cargo run --example speak -- --list-models
+```
+
+| Repo | Name | Language | Params | GGUF |
+|------|------|----------|--------|------|
+| `neuphonic/neutts-nano-q4-gguf` | NeuTTS Nano Q4 | en-us | 0.2B | ✅ |
+| `neuphonic/neutts-nano-q8-gguf` | NeuTTS Nano Q8 | en-us | 0.2B | ✅ |
+| `neuphonic/neutts-nano` | NeuTTS Nano (full) | en-us | 0.2B | |
+| `neuphonic/neutts-air-q4-gguf` | NeuTTS Air Q4 | en-us | 0.7B | ✅ |
+| `neuphonic/neutts-air-q8-gguf` | NeuTTS Air Q8 | en-us | 0.7B | ✅ |
+| `neuphonic/neutts-air` | NeuTTS Air (full) | en-us | 0.7B | |
+| `neuphonic/neutts-nano-german-q4-gguf` | NeuTTS Nano German Q4 | de | 0.2B | ✅ |
+| `neuphonic/neutts-nano-german-q8-gguf` | NeuTTS Nano German Q8 | de | 0.2B | ✅ |
+| `neuphonic/neutts-nano-german` | NeuTTS Nano German (full) | de | 0.2B | |
+| `neuphonic/neutts-nano-french-q4-gguf` | NeuTTS Nano French Q4 | fr-fr | 0.2B | ✅ |
+| `neuphonic/neutts-nano-french-q8-gguf` | NeuTTS Nano French Q8 | fr-fr | 0.2B | ✅ |
+| `neuphonic/neutts-nano-french` | NeuTTS Nano French (full) | fr-fr | 0.2B | |
+| `neuphonic/neutts-nano-spanish-q4-gguf` | NeuTTS Nano Spanish Q4 | es | 0.2B | ✅ |
+| `neuphonic/neutts-nano-spanish-q8-gguf` | NeuTTS Nano Spanish Q8 | es | 0.2B | ✅ |
+| `neuphonic/neutts-nano-spanish` | NeuTTS Nano Spanish (full) | es | 0.2B | ✅ |
+
+To discover which specific GGUF quantisation variants are in a repo:
+
+```sh
+cargo run --example speak -- \
+  --backbone neuphonic/neutts-nano-q4-gguf --list-files
+```
+
+Then pick one with `--gguf-file`:
+
+```sh
+cargo run --example speak --features espeak -- \
+  --backbone  neuphonic/neutts-nano-q4-gguf \
+  --gguf-file neutts-nano-Q4_K_M.gguf \
+  --wav my_voice.wav --ref-text "..." --text "Hello."
 ```
 
 ---
@@ -115,89 +239,64 @@ prompt and pre-encoded reference speaker codes, generates `<|speech_N|>` tokens.
 
 ### NeuCodec decoder (pure Rust)
 
-XCodec2-based architecture loaded from `models/neucodec_decoder.safetensors`:
+XCodec2-based architecture loaded at runtime from `models/neucodec_decoder.safetensors`:
 
 ```
-codes [T]                      FSQ lookup                [T, 2048]
-   └─► decode integer indices ─────────────────────────► project_out (Linear 8→2048)
-                                                               │
-                                                          fc_post_a (Linear 2048→1024)
-                                                               │
-                                                         VocosBackbone
-                                                          ├─ Conv1d(k=7)
-                                                          ├─ 2 × ResnetBlock
-                                                          ├─ 12 × TransformerBlock (RoPE)
-                                                          └─ 2 × ResnetBlock + LayerNorm
-                                                               │
-                                                         ISTFTHead
-                                                          ├─ Linear(1024 → n_fft+2)
-                                                          └─ ISTFT (same padding)
-                                                               │
-                                                        audio [T × hop_length]
+codes [T]
+   └─► FSQ decode  (integer → 8 scaled digits → project_out Linear 8→2048)
+         │
+    fc_post_a  (Linear 2048→1024)
+         │
+   VocosBackbone
+    ├─ Conv1d(k=7)
+    ├─ 2 × ResnetBlock  (GroupNorm → SiLU → Conv1d)
+    ├─ 12 × TransformerBlock  (RMSNorm → MHA + RoPE → SiLU MLP)
+    └─ 2 × ResnetBlock + LayerNorm
+         │
+   ISTFTHead
+    ├─ Linear(1024 → n_fft+2)
+    └─ ISTFT (same padding, Hann window)
+         │
+   audio [T × hop_length]  (24 kHz)
 ```
 
 | Property | Value |
 |----------|-------|
 | Output sample rate | 24 000 Hz |
-| Tokens / second | 50 (hop_length = 480) |
-| Samples / token | 480 |
-| FSQ codebook | 4⁸ = 65 536 codes |
-| Input to encoder | 16 000 Hz mono WAV |
-
----
-
-## Models
-
-### Backbones (GGUF)
-
-| HuggingFace repo | Language | Size |
-|---|---|---|
-| `neuphonic/neutts-nano-q4-gguf` | English | ~75 MB |
-| `neuphonic/neutts-nano-q8-gguf` | English | ~140 MB |
-| `neuphonic/neutts-air-q4-gguf` | English | ~200 MB |
-| `neuphonic/neutts-air-q8-gguf` | English | ~380 MB |
-| `neuphonic/neutts-nano-german-q4-gguf` | German | ~75 MB |
-| `neuphonic/neutts-nano-french-q4-gguf` | French | ~75 MB |
-| `neuphonic/neutts-nano-spanish-q4-gguf` | Spanish | ~75 MB |
-
-### Codec
-
-| Source | Format | Used for |
-|---|---|---|
-| `neuphonic/neucodec` (`pytorch_model.bin`) | PyTorch → safetensors | Decoder (Rust) + Encoder (Python) |
-
-The `scripts/convert_weights.py` helper extracts and saves only the decoder
-weights (~300–700 MB depending on model config).
+| Tokens / second | 50 |
+| Samples / token | 480 (hop_length) |
+| FSQ codebook size | 4⁸ = 65 536 codes |
+| Encoder input | 16 000 Hz mono WAV |
 
 ---
 
 ## Bundled reference voices
 
-Five pre-encoded speaker voices are included:
+Five pre-encoded voices are included and work without any Python encoding step:
 
-| File | Voice |
-|---|---|
-| `samples/dave.npy` | Dave |
-| `samples/greta.npy` | Greta |
-| `samples/jo.npy` | Jo |
-| `samples/juliette.npy` | Juliette |
-| `samples/mateo.npy` | Mateo |
+| Files | Voice | Language |
+|-------|-------|----------|
+| `samples/jo.*` | Jo | English |
+| `samples/dave.*` | Dave | English |
+| `samples/juliette.*` | Juliette | French |
+| `samples/greta.*` | Greta | German |
+| `samples/mateo.*` | Mateo | Spanish |
 
-Each `.npy` has a matching `.wav` (original audio) and `.txt` (transcript).
+Each has a `.wav` (original audio), `.npy` (pre-encoded tokens), and `.txt` (transcript).
 
 ---
 
 ## Feature flags
 
 | Feature | Default | Description |
-|---|---|---|
-| `backbone` | ✓ | GGUF backbone via `llama-cpp-2` (requires cmake + C++ compiler) |
+|---------|---------|-------------|
+| `backbone` | ✓ | GGUF backbone via `llama-cpp-2` (requires cmake + C++) |
 | `espeak` | | Raw-text input via `libespeak-ng` |
 | `wgpu` | | Reserved for future GPU codec acceleration (currently no-op) |
 | `metal` | | macOS Metal GPU for the backbone |
 | `cuda` | | NVIDIA CUDA for the backbone |
 
-**Without `backbone`** — codec-only mode (mobile path); use `NeuCodecDecoder::decode()` directly.
+**Without `backbone`** — codec-only mode; use `NeuCodecDecoder::decode()` directly.
 
 **Without `espeak`** — pass pre-phonemized IPA via `tts.infer_from_ipa()`.
 
@@ -206,7 +305,7 @@ Each `.npy` has a matching `.wav` (original audio) and `.txt` (transcript).
 ## Build requirements
 
 | Platform | Backbone | Codec | Phonemizer |
-|---|---|---|---|
+|----------|----------|-------|------------|
 | Linux / macOS | cmake + C++ (auto) | pure Rust | `libespeak-ng-dev` / `brew install espeak-ng` |
 | iOS / Android | cross-compile llama.cpp | pure Rust | cross-compile espeak-ng; set `ESPEAK_LIB_DIR` |
 
@@ -214,16 +313,23 @@ Each `.npy` has a matching `.wav` (original audio) and `.txt` (transcript).
 
 ## Using the library
 
+### Full pipeline
+
 ```rust
 use neutts::{NeuTTS, download};
 use std::path::Path;
 
 // Download backbone from HuggingFace (cached after first run).
-// Codec weights are loaded from models/neucodec_decoder.safetensors.
-let tts = download::load_from_hub("neuphonic/neutts-nano-q4-gguf").unwrap();
+// Pass None to auto-select the first GGUF in the repo,
+// or Some("filename.gguf") to pick a specific quantisation.
+let tts = download::load_from_hub_cb(
+    "neuphonic/neutts-nano-q4-gguf",
+    None,           // or Some("neutts-nano-Q4_K_M.gguf")
+    |_| {},
+).unwrap();
 
 // Load pre-encoded reference codes
-let ref_codes = tts.load_ref_codes(Path::new("ref.npy")).unwrap();
+let ref_codes = tts.load_ref_codes(Path::new("samples/jo.npy")).unwrap();
 
 // Synthesise — returns Vec<f32> at 24 kHz mono
 let audio = tts.infer(
@@ -236,13 +342,33 @@ let audio = tts.infer(
 tts.write_wav(&audio, Path::new("output.wav")).unwrap();
 ```
 
+### Discover models programmatically
+
+```rust
+use neutts::download::{BACKBONE_MODELS, list_gguf_files, find_model};
+
+// Iterate the registry
+for m in BACKBONE_MODELS {
+    println!("{} ({}) — GGUF: {}", m.repo, m.language, m.is_gguf);
+}
+
+// Find a specific repo
+if let Some(info) = find_model("neuphonic/neutts-nano-q4-gguf") {
+    println!("language: {}", info.language); // "en-us"
+}
+
+// List GGUF files available in a repo (network call)
+let files = list_gguf_files("neuphonic/neutts-nano-q4-gguf").unwrap();
+for f in &files { println!("{f}"); }
+```
+
 ### IPA passthrough (without espeak)
 
 ```rust
 let audio = tts.infer_from_ipa(
-    "hɛloʊ fɹʌm ɹʌst",   // input IPA
+    "hɛloʊ fɹʌm ɹʌst",    // input IPA
     &ref_codes,
-    "wɪ ɑːɹ tɛstɪŋ ðɪs", // reference IPA
+    "wɪ ɑːɹ tɛstɪŋ ðɪs",  // reference IPA
 ).unwrap();
 ```
 
@@ -251,7 +377,8 @@ let audio = tts.infer_from_ipa(
 ```rust
 use neutts::NeuCodecDecoder;
 
-let dec = NeuCodecDecoder::new().unwrap(); // loads models/neucodec_decoder.safetensors
+// Loads models/neucodec_decoder.safetensors at runtime
+let dec = NeuCodecDecoder::new().unwrap();
 println!("backend: {}", dec.backend_name()); // "cpu (ndarray)"
 println!("{} samples/token", dec.hop_length());
 
@@ -263,11 +390,11 @@ let audio: Vec<f32> = dec.decode(&codes).unwrap();
 
 ```rust
 use neutts::RefCodeCache;
+use std::path::Path;
 
 let cache = RefCodeCache::new()?;
-// Returns cached codes or error if not cached — encode with Python then store
 if let Some((codes, outcome)) = cache.try_load(Path::new("reference.wav"))? {
-    println!("{outcome}");
+    println!("{outcome}"); // "Cache hit (SHA-256: …)"
 }
 ```
 
@@ -275,19 +402,15 @@ if let Some((codes, outcome)) = cache.try_load(Path::new("reference.wav"))? {
 
 ## Mobile / C FFI
 
-The GGUF backbone is heavy for on-device deployment.  A practical mobile
-architecture runs the backbone server-side and only the NeuCodec decoder
-on-device via the C FFI:
+A practical mobile architecture runs the backbone server-side and only the
+NeuCodec decoder on-device:
 
 ```c
-// Load decoder (safetensors weights must be bundled with the app)
 NeuTtsHandle *codec = neutts_model_load("/path/to/neucodec_decoder.safetensors");
 
-// Decode tokens from server
-size_t n;
-float *audio = neutts_decode_tokens(codec, codes, num_codes, &n);
-neutts_write_wav(audio, n, "/path/to/output.wav");
-neutts_free_audio(audio, n);
+float *audio = neutts_decode_tokens(codec, codes, num_codes, &n_samples);
+neutts_write_wav(audio, n_samples, "/path/to/output.wav");
+neutts_free_audio(audio, n_samples);
 neutts_model_free(codec);
 ```
 
@@ -309,13 +432,35 @@ See [`include/neutts.h`](include/neutts.h) for the full C header.
 ## Status
 
 | Component | Status |
-|---|---|
+|-----------|--------|
 | GGUF backbone inference | ✅ |
-| NeuCodec decoder (pure Rust) | ✅ weights loaded from safetensors |
-| NeuCodec encoder (pure Rust) | ⏳ not yet — use Python `neucodec` package |
-| Multi-language backbones | ✅ German, French, Spanish |
+| NeuCodec decoder (pure Rust, safetensors) | ✅ |
+| NeuCodec encoder (pure Rust) | ⏳ not yet — `speak` example falls back to Python `neucodec` |
+| English backbones (Nano / Air, Q4 / Q8) | ✅ |
+| German / French / Spanish backbones | ✅ |
+| Full (non-GGUF) model repos | ✅ in registry; GGUF files detected automatically |
 | GPU acceleration (codec) | ⏳ planned via `wgpu` feature |
 | iOS / Android build | ✅ codec is pure Rust; backbone needs cross-compile |
+
+---
+
+## Citation
+
+If you use this software in your research or project, please cite it as:
+
+```bibtex
+@software{hauptmann2026neuttsrs,
+  author       = {Hauptmann, Eugene},
+  title        = {{neutts}: Rust port of {NeuTTS} — on-device voice-cloning {TTS}
+                  with {GGUF} backbone and {NeuCodec} decoder},
+  year         = {2026},
+  version      = {0.0.1},
+  license      = {MIT},
+  url          = {https://github.com/eugenehp/neutts-rs}
+}
+```
+
+If you also use the underlying NeuTTS model or NeuCodec, please cite those works directly via their respective HuggingFace repositories at [huggingface.co/neuphonic](https://huggingface.co/neuphonic).
 
 ---
 
