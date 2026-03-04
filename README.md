@@ -1,205 +1,324 @@
 # neutts-rs
 
 Rust port of [NeuTTS](https://github.com/neuphonic/neutts) — on-device voice-cloning TTS
-built on a GGUF LLM backbone and the NeuCodec neural audio codec.
+built on a GGUF LLM backbone and the [NeuCodec](https://huggingface.co/neuphonic/neucodec)
+neural audio codec.
 
-_Created by [Neuphonic](https://neuphonic.com/) — building faster, smaller, on-device voice AI._
+**Pure Rust — no ONNX Runtime, no native ML dependencies.**  
+The codec runs as a self-contained CPU inference engine (`safetensors` + `ndarray` + `rustfft`).
+
+---
 
 ## Quick start
 
-```rust
-use neutts::{NeuTTS, download};
-use std::path::Path;
+### 1. Install system dependencies
 
-// Download backbone + codec from HuggingFace (cached after first run)
-let tts = download::load_from_hub(
-    "neuphonic/neutts-nano-q4-gguf",
-    "neuphonic/neucodec-onnx-decoder",
-).unwrap();
+```sh
+# macOS
+brew install espeak-ng
 
-// Load pre-encoded reference codes (see "Pre-encoding reference audio" below)
-let ref_codes = tts.load_ref_codes(Path::new("samples/jo.npy")).unwrap();
-let ref_text  = "We are testing this model today.";
+# Ubuntu / Debian
+apt install espeak-ng
 
-// Synthesise — returns Vec<f32> at 24 kHz mono
-let audio = tts.infer("Hello from Rust!", &ref_codes, ref_text).unwrap();
-
-// Save to WAV
-tts.write_wav(&audio, Path::new("output.wav")).unwrap();
+# Alpine
+apk add espeak-ng
 ```
+
+### 2. Convert codec weights (one-time, ~2 min)
+
+```sh
+pip install torch huggingface_hub safetensors
+python scripts/convert_weights.py
+```
+
+Downloads `neuphonic/neucodec/pytorch_model.bin`, extracts the decoder weights,
+and saves them as `models/neucodec_decoder.safetensors`.
+
+### 3. Build
+
+```sh
+cargo build --features espeak
+```
+
+### 4. Encode a reference voice
+
+Encoding is not yet implemented in pure Rust (it requires the heavy Wav2Vec2Bert
+semantic model).  Use Python once per reference speaker:
+
+```sh
+pip install neucodec torchaudio numpy
+python -c "
+from neucodec import NeuCodec
+import numpy as np, torchaudio
+model = NeuCodec.from_pretrained('neuphonic/neucodec')
+y, sr = torchaudio.load('reference.wav')
+codes = model.encode_code(y)
+np.save('ref.npy', codes.numpy().astype('int32'))
+print(f'{len(codes[0])} tokens saved')
+"
+```
+
+### 5. Synthesise
+
+```sh
+cargo run --example basic --features espeak -- \
+  --ref-codes ref.npy \
+  --ref-text  "Transcript of your reference recording." \
+  --text      "Hello, this is your cloned voice speaking."
+```
+
+---
+
+## Examples
+
+| Example | What it does |
+|---------|-------------|
+| `test_pipeline` | Smoke-test every pipeline component that works without model files |
+| `basic` | Synthesise from a pre-encoded `.npy` reference |
+| `clone_voice` | Full voice cloning — pre-encoded `.npy` or raw WAV + auto SHA-256 cache |
+| `encode_reference` | Stub — returns a helpful error; use Python for now |
+| `download_models` | Download / stage weights (updated for safetensors workflow) |
+
+```sh
+# No models needed
+cargo run --example test_pipeline --no-default-features
+
+# Synthesis
+cargo run --example basic --features espeak
+
+# Voice cloning with cache
+cargo run --example clone_voice --features espeak -- \
+  --ref-codes samples/jo.npy \
+  --ref-text  samples/jo.txt \
+  --text      "Hello from Rust."
+```
+
+---
+
+## Architecture
+
+```
+text ──► espeak-ng ──► IPA ──┐
+                              ├──► prompt builder ──► GGUF backbone ──► speech tokens
+ref_codes (.npy) ─────────────┘                                               │
+                                                                               ▼
+                                                                   NeuCodec decoder
+                                                                               │
+                                                                               ▼
+                                                                   audio (Vec<f32>, 24 kHz)
+```
+
+### GGUF backbone
+
+Small causal LM in GGUF format, run via `llama-cpp-2`.  Takes a phonemized text
+prompt and pre-encoded reference speaker codes, generates `<|speech_N|>` tokens.
+
+### NeuCodec decoder (pure Rust)
+
+XCodec2-based architecture loaded from `models/neucodec_decoder.safetensors`:
+
+```
+codes [T]                      FSQ lookup                [T, 2048]
+   └─► decode integer indices ─────────────────────────► project_out (Linear 8→2048)
+                                                               │
+                                                          fc_post_a (Linear 2048→1024)
+                                                               │
+                                                         VocosBackbone
+                                                          ├─ Conv1d(k=7)
+                                                          ├─ 2 × ResnetBlock
+                                                          ├─ 12 × TransformerBlock (RoPE)
+                                                          └─ 2 × ResnetBlock + LayerNorm
+                                                               │
+                                                         ISTFTHead
+                                                          ├─ Linear(1024 → n_fft+2)
+                                                          └─ ISTFT (same padding)
+                                                               │
+                                                        audio [T × hop_length]
+```
+
+| Property | Value |
+|----------|-------|
+| Output sample rate | 24 000 Hz |
+| Tokens / second | 50 (hop_length = 480) |
+| Samples / token | 480 |
+| FSQ codebook | 4⁸ = 65 536 codes |
+| Input to encoder | 16 000 Hz mono WAV |
+
+---
 
 ## Models
 
 ### Backbones (GGUF)
 
-| HuggingFace repo                              | Language | Size  |
-|-----------------------------------------------|----------|-------|
-| `neuphonic/neutts-air-q4-gguf`                | English  | ~200 MB |
-| `neuphonic/neutts-air-q8-gguf`                | English  | ~380 MB |
-| `neuphonic/neutts-nano-q4-gguf`               | English  | ~75 MB  |
-| `neuphonic/neutts-nano-q8-gguf`               | English  | ~140 MB |
-| `neuphonic/neutts-nano-german-q4-gguf`        | German   | ~75 MB  |
-| `neuphonic/neutts-nano-french-q4-gguf`        | French   | ~75 MB  |
-| `neuphonic/neutts-nano-spanish-q4-gguf`       | Spanish  | ~75 MB  |
+| HuggingFace repo | Language | Size |
+|---|---|---|
+| `neuphonic/neutts-nano-q4-gguf` | English | ~75 MB |
+| `neuphonic/neutts-nano-q8-gguf` | English | ~140 MB |
+| `neuphonic/neutts-air-q4-gguf` | English | ~200 MB |
+| `neuphonic/neutts-air-q8-gguf` | English | ~380 MB |
+| `neuphonic/neutts-nano-german-q4-gguf` | German | ~75 MB |
+| `neuphonic/neutts-nano-french-q4-gguf` | French | ~75 MB |
+| `neuphonic/neutts-nano-spanish-q4-gguf` | Spanish | ~75 MB |
 
-### Codecs (ONNX)
+### Codec
 
-| HuggingFace repo                              | Notes              |
-|-----------------------------------------------|--------------------|
-| `neuphonic/neucodec-onnx-decoder`             | Full precision     |
-| `neuphonic/neucodec-onnx-decoder-int8`        | Faster, smaller    |
+| Source | Format | Used for |
+|---|---|---|
+| `neuphonic/neucodec` (`pytorch_model.bin`) | PyTorch → safetensors | Decoder (Rust) + Encoder (Python) |
 
-## Architecture
+The `scripts/convert_weights.py` helper extracts and saves only the decoder
+weights (~300–700 MB depending on model config).
 
-```
-text ──► phonemize (espeak-ng) ──► prompt builder ──► GGUF backbone ──► speech tokens
-                                         ▲                                     │
-                                  ref_codes + ref_text                         ▼
-                                                                    NeuCodec ONNX decoder
-                                                                               │
-                                                                               ▼
-                                                                    audio (Vec<f32>, 24 kHz)
-```
+---
 
-The synthesis pipeline has two models:
+## Bundled reference voices
 
-1. **GGUF backbone** — a small causal LM (NeuTTS-Nano or NeuTTS-Air) that takes a phonemized
-   text prompt and pre-encoded reference speaker codes, then generates speech token IDs.
+Five pre-encoded speaker voices are included:
 
-2. **NeuCodec ONNX decoder** — a 50 Hz neural audio codec that converts speech token IDs
-   back to a 24 kHz waveform (480 samples per token).
-
-## Pre-encoding reference audio
-
-The reference codes (speaker embedding for voice cloning) must be computed with the NeuCodec
-encoder, which is currently only available in Python:
-
-```python
-from neutts import NeuTTS
-import numpy as np
-
-tts = NeuTTS(codec_repo="neuphonic/neucodec")
-codes = tts.encode_reference("reference.wav")           # -> int tensor, ~50 tokens/sec
-np.save("ref_codes.npy", codes.numpy().astype("int32"))
-```
-
-Pass the saved `.npy` path to `NeuTTS::load_ref_codes()`, or supply it on the
-command line via `--ref-codes` (or `--ref-audio` with the matching `.wav`).
-
-### Bundled samples
-
-Five pre-encoded speaker voices ship with the repo and are ready to use immediately:
-
-| File                   | Voice    |
-|------------------------|----------|
-| `samples/dave.npy`     | Dave     |
-| `samples/greta.npy`    | Greta    |
-| `samples/jo.npy`       | Jo       |
+| File | Voice |
+|---|---|
+| `samples/dave.npy` | Dave |
+| `samples/greta.npy` | Greta |
+| `samples/jo.npy` | Jo |
 | `samples/juliette.npy` | Juliette |
-| `samples/mateo.npy`    | Mateo    |
+| `samples/mateo.npy` | Mateo |
 
-Each `.npy` file has a matching `.wav` (the original reference audio) and `.txt`
-(its transcript).  If you pass a path that doesn't exist, the CLI will print the
-full list of available samples automatically.
+Each `.npy` has a matching `.wav` (original audio) and `.txt` (transcript).
 
-## Running the `basic` example
-
-```sh
-# Minimal — uses the Jo voice by default
-cargo run --example basic --features espeak -- \
-  --text "Hello from Rust."
-
-# Choose a different bundled voice
-cargo run --example basic --features espeak -- \
-  --text "Hello from Rust." \
-  --ref-audio samples/dave.wav \
-  --out output.wav
-
-# Your own reference audio (needs a pre-encoded .npy — see above)
-cargo run --example basic --features espeak -- \
-  --text "Hello from Rust." \
-  --ref-codes path/to/my_voice.npy \
-  --ref-text  "Transcript of the reference recording." \
-  --out output.wav
-```
-
-### CLI flags
-
-| Flag | Alias | Default | Description |
-|------|-------|---------|-------------|
-| `--backbone` | | `neuphonic/neutts-nano-q4-gguf` | HuggingFace backbone repo |
-| `--codec` | | `neuphonic/neucodec-onnx-decoder` | HuggingFace codec repo |
-| `--text` | | built-in demo sentence | Text to synthesise |
-| `--ref-codes` | | `samples/jo.npy` | Pre-encoded reference codes (`.npy`) |
-| `--ref-audio` | | | Reference `.wav` — derives the `.npy` path from the same stem |
-| `--ref-text` | | `samples/jo.txt` | Transcript of the reference audio (file path or literal string) |
-| `--output` | `--out` | `output.wav` | Output WAV file |
-
-## Build requirements
-
-| Platform      | Backbone (llama.cpp)          | Codec (ort)      | Phonemizer (espeak-ng) |
-|---------------|-------------------------------|------------------|------------------------|
-| Linux         | cmake + GCC/Clang (auto-build)| auto-downloaded  | `apt install libespeak-ng-dev` |
-| macOS         | Xcode CLI tools (auto-build)  | auto-downloaded  | `brew install espeak-ng` |
-| iOS           | cross-compile llama.cpp       | bundled `.a`     | cross-compile espeak-ng; set `ESPEAK_LIB_DIR` |
-| Android       | cross-compile llama.cpp       | bundled `.so`    | cross-compile espeak-ng; set `ESPEAK_LIB_DIR` |
+---
 
 ## Feature flags
 
-| Feature    | Default | Description                                                      |
-|------------|---------|------------------------------------------------------------------|
-| `backbone` | ✓       | GGUF backbone via llama-cpp-2 (requires cmake + C++ compiler)    |
-| `espeak`   |         | Raw-text input via libespeak-ng                                  |
-| `metal`    |         | macOS Metal GPU acceleration for the backbone                    |
-| `cuda`     |         | NVIDIA CUDA acceleration for the backbone                        |
+| Feature | Default | Description |
+|---|---|---|
+| `backbone` | ✓ | GGUF backbone via `llama-cpp-2` (requires cmake + C++ compiler) |
+| `espeak` | | Raw-text input via `libespeak-ng` |
+| `wgpu` | | Reserved for future GPU codec acceleration (currently no-op) |
+| `metal` | | macOS Metal GPU for the backbone |
+| `cuda` | | NVIDIA CUDA for the backbone |
 
-**Without `espeak`** — use `NeuTTS::infer_from_ipa()` to pass pre-phonemized IPA strings.
+**Without `backbone`** — codec-only mode (mobile path); use `NeuCodecDecoder::decode()` directly.
 
-**Without `backbone`** — use `NeuTTS::decode_tokens()` for codec-only decoding (mobile path).
+**Without `espeak`** — pass pre-phonemized IPA via `tts.infer_from_ipa()`.
 
-## Skip phonemisation
+---
 
-When the `espeak` feature is disabled, pass IPA directly:
+## Build requirements
+
+| Platform | Backbone | Codec | Phonemizer |
+|---|---|---|---|
+| Linux / macOS | cmake + C++ (auto) | pure Rust | `libespeak-ng-dev` / `brew install espeak-ng` |
+| iOS / Android | cross-compile llama.cpp | pure Rust | cross-compile espeak-ng; set `ESPEAK_LIB_DIR` |
+
+---
+
+## Using the library
 
 ```rust
-// IPA from a server, pre-built table, or a different G2P library.
-let ref_ipa   = "wɪ ɑːɹ tɛstɪŋ ðɪs mɑːdl̩ tədeɪ";
-let input_ipa = "hɛloʊ fɹʌm ɹʌst";
-let audio = tts.infer_from_ipa(input_ipa, &ref_codes, ref_ipa).unwrap();
+use neutts::{NeuTTS, download};
+use std::path::Path;
+
+// Download backbone from HuggingFace (cached after first run).
+// Codec weights are loaded from models/neucodec_decoder.safetensors.
+let tts = download::load_from_hub("neuphonic/neutts-nano-q4-gguf").unwrap();
+
+// Load pre-encoded reference codes
+let ref_codes = tts.load_ref_codes(Path::new("ref.npy")).unwrap();
+
+// Synthesise — returns Vec<f32> at 24 kHz mono
+let audio = tts.infer(
+    "Hello from Rust!",
+    &ref_codes,
+    "Transcript of the reference recording.",
+).unwrap();
+
+// Save to WAV
+tts.write_wav(&audio, Path::new("output.wav")).unwrap();
 ```
 
-## Mobile (iOS / Android)
+### IPA passthrough (without espeak)
 
-The GGUF backbone can be heavy for on-device deployment.  A practical mobile
-architecture has the backbone run server-side and only the NeuCodec ONNX decoder
-run on-device via the C FFI:
+```rust
+let audio = tts.infer_from_ipa(
+    "hɛloʊ fɹʌm ɹʌst",   // input IPA
+    &ref_codes,
+    "wɪ ɑːɹ tɛstɪŋ ðɪs", // reference IPA
+).unwrap();
+```
+
+### Decoder only
+
+```rust
+use neutts::NeuCodecDecoder;
+
+let dec = NeuCodecDecoder::new().unwrap(); // loads models/neucodec_decoder.safetensors
+println!("backend: {}", dec.backend_name()); // "cpu (ndarray)"
+println!("{} samples/token", dec.hop_length());
+
+let codes: Vec<i32> = vec![/* speech token IDs */];
+let audio: Vec<f32> = dec.decode(&codes).unwrap();
+```
+
+### Reference-code cache
+
+```rust
+use neutts::RefCodeCache;
+
+let cache = RefCodeCache::new()?;
+// Returns cached codes or error if not cached — encode with Python then store
+if let Some((codes, outcome)) = cache.try_load(Path::new("reference.wav"))? {
+    println!("{outcome}");
+}
+```
+
+---
+
+## Mobile / C FFI
+
+The GGUF backbone is heavy for on-device deployment.  A practical mobile
+architecture runs the backbone server-side and only the NeuCodec decoder
+on-device via the C FFI:
 
 ```c
-// App startup
-neutts_set_espeak_data_path("/path/to/espeak-ng-data");
-NeuTtsHandle *codec = neutts_model_load("/path/to/neucodec_decoder.onnx");
+// Load decoder (safetensors weights must be bundled with the app)
+NeuTtsHandle *codec = neutts_model_load("/path/to/neucodec_decoder.safetensors");
 
-// Each utterance (codes arrive from server)
+// Decode tokens from server
 size_t n;
 float *audio = neutts_decode_tokens(codec, codes, num_codes, &n);
 neutts_write_wav(audio, n, "/path/to/output.wav");
 neutts_free_audio(audio, n);
-
-// Shutdown
 neutts_model_free(codec);
 ```
 
 See [`include/neutts.h`](include/neutts.h) for the full C header.
 
-## Pipeline (matching Python neutts)
+---
 
-1. **Text preprocessing** — numbers, currencies, abbreviations → spoken words.
-2. **Phonemisation** — espeak-ng converts text to IPA phonemes.
-3. **Prompt construction** — reference codes + IPA phonemes → GGUF prompt.
-4. **Backbone inference** — GGUF LLM generates `<|speech_N|>` tokens.
-5. **Token extraction** — regex extracts integer IDs from generated text.
-6. **Codec decode** — NeuCodec ONNX decoder converts IDs to 24 kHz audio.
+## Pipeline stages
+
+1. **Text preprocessing** — numbers, currencies, abbreviations → spoken words
+2. **Phonemisation** — espeak-ng converts text to IPA phonemes
+3. **Prompt construction** — reference codes + IPA → GGUF prompt
+4. **Backbone inference** — GGUF LLM generates `<|speech_N|>` tokens
+5. **Token extraction** — regex extracts integer IDs from generated text
+6. **Codec decode** — NeuCodec decoder converts IDs to 24 kHz audio
+
+---
+
+## Status
+
+| Component | Status |
+|---|---|
+| GGUF backbone inference | ✅ |
+| NeuCodec decoder (pure Rust) | ✅ weights loaded from safetensors |
+| NeuCodec encoder (pure Rust) | ⏳ not yet — use Python `neucodec` package |
+| Multi-language backbones | ✅ German, French, Spanish |
+| GPU acceleration (codec) | ⏳ planned via `wgpu` feature |
+| iOS / Android build | ✅ codec is pure Rust; backbone needs cross-compile |
+
+---
 
 ## License
 
-Apache-2.0
+MIT

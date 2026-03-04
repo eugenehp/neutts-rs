@@ -1,87 +1,1124 @@
-//! NeuCodec ONNX decoder — converts speech token IDs to a 24 kHz audio waveform.
+//! NeuCodec decoder — pure-Rust CPU inference from safetensors weights.
 //!
-//! Wraps the `neuphonic/neucodec-onnx-decoder` (or its int8 variant) ONNX model
-//! using [`ort`] (ONNX Runtime Rust bindings).
+//! ## Architecture (XCodec2-based)
 //!
-//! ## Model interface
+//! ```text
+//!  codes [T]  ──►  FSQ lookup  ──►  fc_post_a  ──►  VocosBackbone  ──►  ISTFTHead  ──►  audio
+//! (int, 0..65535)  [T, 2048]      [T, 1024]        [T, 1024]                          [T*hop]
+//! ```
 //!
-//! | Input  | Name     | Shape       | dtype |
-//! |--------|----------|-------------|-------|
-//! | 0      | `codes`  | `[1, 1, T]` | int32 |
+//! **VocosBackbone**: Conv1d(k=7) → 2×ResnetBlock → 12×TransformerBlock (RoPE) → 2×ResnetBlock → LayerNorm
 //!
-//! | Output | Name    | Shape            | dtype   |
-//! |--------|---------|------------------|---------|
-//! | 0      | `audio` | `[1, 1, T_audio]`| float32 |
+//! **ISTFTHead**: Linear(1024 → n_fft+2) → split mag/phase → ISTFT
 //!
-//! The codec runs at 50 Hz: each input token corresponds to
-//! `24 000 / 50 = 480` output audio samples.
+//! ## Setup (one-time)
+//!
+//! ```sh
+//! python scripts/convert_weights.py   # download + extract decoder weights to safetensors
+//! ```
+//!
+//! Weights are then loaded at runtime from `models/neucodec_decoder.safetensors`.
 
-use std::{path::Path, sync::Mutex};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use ort::{session::Session, value::Tensor};
+use anyhow::{bail, Context, Result};
+use ndarray::{s, Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
+use rustfft::{num_complex::Complex, FftPlanner};
+use safetensors::SafeTensors;
 
-/// Audio sample rate produced by NeuCodec.
+// ─── Public constants ─────────────────────────────────────────────────────────
+
+/// Sample rate of the decoder output (24 kHz).
 pub const SAMPLE_RATE: u32 = 24_000;
 
-/// NeuCodec ONNX decoder handle.
+/// Sample rate the encoder expects as input (16 kHz).
+pub const ENCODER_SAMPLE_RATE: u32 = 16_000;
+
+/// Decoder audio samples per speech token — assuming 50 tokens/s at 24 kHz.
+/// The actual value is detected from the weight shapes at load time.
+pub const SAMPLES_PER_TOKEN: usize = 480;
+
+/// Encoder audio samples consumed per speech token (16 000 / 50 = 320).
+pub const ENCODER_SAMPLES_PER_TOKEN: usize = 320;
+
+/// Default reference audio length for the encoder: 10 s × 16 000 Hz.
+pub const ENCODER_DEFAULT_INPUT_SAMPLES: usize = 16_000 * 10;
+
+/// True when the `wgpu` Cargo feature is enabled (reserved for future GPU
+/// acceleration — codec currently always runs on CPU).
+pub fn wgpu_feature_enabled() -> bool {
+    cfg!(feature = "wgpu")
+}
+
+// ─── FSQ constants ────────────────────────────────────────────────────────────
+
+/// FSQ levels for NeuCodec: 8 dimensions × 4 levels → 4^8 = 65 536 codes.
+const FSQ_LEVELS: [i32; 8] = [4, 4, 4, 4, 4, 4, 4, 4];
+
+/// Cumulative products of FSQ_LEVELS: used to decompose an integer code.
+/// basis[j] = product(FSQ_LEVELS[0..j])
+const FSQ_BASIS: [i32; 8] = [1, 4, 16, 64, 256, 1_024, 4_096, 16_384];
+
+// ─── Tensor helpers ───────────────────────────────────────────────────────────
+
+fn load_f32(st: &SafeTensors<'_>, name: &str) -> Result<Vec<f32>> {
+    let view = st
+        .tensor(name)
+        .with_context(|| format!("Missing weight: {name}"))?;
+    let raw = view.data();
+    use safetensors::tensor::Dtype;
+    Ok(match view.dtype() {
+        Dtype::F32 => raw
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        Dtype::BF16 => raw
+            .chunks_exact(2)
+            .map(|b| {
+                let bits = u16::from_le_bytes([b[0], b[1]]);
+                f32::from_bits((bits as u32) << 16)
+            })
+            .collect(),
+        dt => bail!("Tensor {name}: unsupported dtype {dt:?} (expected F32 or BF16)"),
+    })
+}
+
+fn shape_of(st: &SafeTensors<'_>, name: &str) -> Result<Vec<usize>> {
+    Ok(st
+        .tensor(name)
+        .with_context(|| format!("Missing weight: {name}"))?
+        .shape()
+        .to_vec())
+}
+
+fn as1d(data: Vec<f32>, n: usize) -> Array1<f32> {
+    Array1::from_shape_vec(n, data).expect("1-D shape mismatch")
+}
+
+fn as2d(data: Vec<f32>, rows: usize, cols: usize) -> Array2<f32> {
+    Array2::from_shape_vec((rows, cols), data).expect("2-D shape mismatch")
+}
+
+fn as3d(data: Vec<f32>, d0: usize, d1: usize, d2: usize) -> Array3<f32> {
+    Array3::from_shape_vec((d0, d1, d2), data).expect("3-D shape mismatch")
+}
+
+// ─── Math primitives ──────────────────────────────────────────────────────────
+
+/// Linear layer: `out = x @ w.T + b`
+///
+/// * `x`: \[T, in_dim\]
+/// * `w`: \[out_dim, in_dim\]  (PyTorch row-major convention)
+/// * `b`: \[out_dim\]  (optional)
+/// * returns: \[T, out_dim\]
+fn linear(x: ArrayView2<f32>, w: ArrayView2<f32>, b: Option<ArrayView1<f32>>) -> Array2<f32> {
+    let mut out = x.dot(&w.t()); // [T, out_dim]
+    if let Some(b) = b {
+        out += &b;
+    }
+    out
+}
+
+/// Conv1d with same-length output (zero-padded).
+///
+/// * `x`: \[c_in, T\]
+/// * `w`: \[c_out, c_in, k\]
+/// * `b`: \[c_out\]  (optional)
+/// * returns: \[c_out, T\]
+fn conv1d(
+    x: ArrayView2<f32>,
+    w: ArrayView3<f32>,
+    b: Option<ArrayView1<f32>>,
+    pad: usize,
+) -> Array2<f32> {
+    let (c_in, t) = (x.shape()[0], x.shape()[1]);
+    let (c_out, _, k) = (w.shape()[0], w.shape()[1], w.shape()[2]);
+
+    // im2col: build [T, c_in × k] column matrix
+    let mut col = Array2::<f32>::zeros((t, c_in * k));
+    for ti in 0..t {
+        for ci in 0..c_in {
+            for ki in 0..k {
+                let src = ti + ki;
+                if src >= pad && src < t + pad {
+                    col[[ti, ci * k + ki]] = x[[ci, src - pad]];
+                }
+                // else zero-pad (already zeroed)
+            }
+        }
+    }
+
+    // weight: [c_out, c_in × k]
+    let w2 = w.into_shape_with_order((c_out, c_in * k)).expect("conv1d reshape");
+
+    // out_t = col @ w2.T  →  [T, c_out]  then transpose to [c_out, T]
+    let out_t = col.dot(&w2.t());
+    let mut out = out_t.t().to_owned(); // [c_out, T]
+
+    if let Some(b) = b {
+        for co in 0..c_out {
+            let bias_val = b[co];
+            out.slice_mut(s![co, ..]).mapv_inplace(|v| v + bias_val);
+        }
+    }
+    out
+}
+
+/// GroupNorm: `affine=True`, over input \[C, T\].
+/// Normalises over (group_size × T) elements per group.
+fn group_norm(
+    x: ArrayView2<f32>,
+    n_groups: usize,
+    w: ArrayView1<f32>,
+    b: ArrayView1<f32>,
+    eps: f32,
+) -> Array2<f32> {
+    let (c, t) = (x.shape()[0], x.shape()[1]);
+    let group_size = c / n_groups;
+    let mut out = Array2::<f32>::zeros((c, t));
+
+    for g in 0..n_groups {
+        let c_start = g * group_size;
+        let c_end = c_start + group_size;
+        let block = x.slice(s![c_start..c_end, ..]);
+        let n = (group_size * t) as f32;
+        let mean = block.sum() / n;
+        let var = block.mapv(|v| (v - mean).powi(2)).sum() / n;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        for ci in c_start..c_end {
+            for ti in 0..t {
+                out[[ci, ti]] = (x[[ci, ti]] - mean) * inv_std * w[ci] + b[ci];
+            }
+        }
+    }
+    out
+}
+
+/// LayerNorm over the last axis of \[T, C\].
+fn layer_norm(
+    x: ArrayView2<f32>,
+    w: ArrayView1<f32>,
+    b: ArrayView1<f32>,
+    eps: f32,
+) -> Array2<f32> {
+    let (t, c) = (x.shape()[0], x.shape()[1]);
+    let mut out = Array2::<f32>::zeros((t, c));
+    for ti in 0..t {
+        let row = x.slice(s![ti, ..]);
+        let mean = row.sum() / c as f32;
+        let var = row.mapv(|v| (v - mean).powi(2)).sum() / c as f32;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        for ci in 0..c {
+            out[[ti, ci]] = (x[[ti, ci]] - mean) * inv_std * w[ci] + b[ci];
+        }
+    }
+    out
+}
+
+/// RMSNorm over the last axis of \[T, C\].
+fn rms_norm(x: ArrayView2<f32>, w: ArrayView1<f32>, eps: f32) -> Array2<f32> {
+    let (t, c) = (x.shape()[0], x.shape()[1]);
+    let mut out = Array2::<f32>::zeros((t, c));
+    for ti in 0..t {
+        let row = x.slice(s![ti, ..]);
+        let ms = row.mapv(|v| v * v).sum() / c as f32;
+        let scale = 1.0 / (ms + eps).sqrt();
+        for ci in 0..c {
+            out[[ti, ci]] = x[[ti, ci]] * scale * w[ci];
+        }
+    }
+    out
+}
+
+/// SiLU (swish): `x * σ(x)`.
+#[inline(always)]
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// Row-wise softmax (in-place) over \[T\].
+fn softmax_inplace(x: &mut [f32]) {
+    let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    x.iter_mut().for_each(|v| {
+        *v = (*v - max).exp();
+        sum += *v;
+    });
+    x.iter_mut().for_each(|v| *v /= sum);
+}
+
+// ─── FSQ decode ───────────────────────────────────────────────────────────────
+
+/// Decode integer FSQ codes → continuous embeddings.
+///
+/// For each code (0..65535):
+/// 1. Decompose into 8 base-4 digits using `FSQ_BASIS`.
+/// 2. Scale each digit d ∈ {0,1,2,3} to {−1, −⅓, ⅓, 1} via `(d/1.5) - 1`.
+/// 3. Apply the `project_out` linear layer (8 → 2048).
+///
+/// Returns \[T, fsq_out_dim\].
+fn fsq_decode(
+    codes: &[i32],
+    proj_w: ArrayView2<f32>, // [fsq_out_dim, 8]
+    proj_b: ArrayView1<f32>, // [fsq_out_dim]
+) -> Array2<f32> {
+    let t = codes.len();
+    let _out_dim = proj_w.shape()[0];
+
+    // Build [T, 8] matrix of scaled FSQ digits
+    let mut digits = Array2::<f32>::zeros((t, FSQ_BASIS.len()));
+    for (i, &code) in codes.iter().enumerate() {
+        for (j, (&basis, &levels)) in FSQ_BASIS.iter().zip(FSQ_LEVELS.iter()).enumerate() {
+            let d = (code / basis) % levels;
+            // Scale from {0,1,…,L-1} to {-1, -1/3, 1/3, 1} for L=4
+            // Formula: (d / ((L-1)/2)) - 1  =  (d / 1.5) - 1
+            digits[[i, j]] = d as f32 / 1.5 - 1.0;
+        }
+    }
+
+    // project_out: [T, 8] @ [8, out_dim] + [out_dim]
+    linear(digits.view(), proj_w, Some(proj_b))
+}
+
+// ─── Rotary positional embedding ──────────────────────────────────────────────
+
+/// Apply split-half RoPE (torchtune convention) to `x` in-place.
+///
+/// * `x`: \[T, n_heads, head_dim\]
+fn apply_rope(x: &mut Array3<f32>) {
+    let (t, n_heads, head_dim) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+    let half = head_dim / 2;
+
+    // Precompute (cos, sin) for each (position, freq) pair
+    let freqs: Vec<f32> = (0..half)
+        .map(|i| 1.0_f32 / 10_000_f32.powf(2.0 * i as f32 / head_dim as f32))
+        .collect();
+
+    for p in 0..t {
+        let theta: Vec<f32> = freqs.iter().map(|&f| p as f32 * f).collect();
+        for h in 0..n_heads {
+            for i in 0..half {
+                let (c, s) = (theta[i].cos(), theta[i].sin());
+                let x1 = x[[p, h, i]];
+                let x2 = x[[p, h, i + half]];
+                x[[p, h, i]] = x1 * c - x2 * s;
+                x[[p, h, i + half]] = x1 * s + x2 * c;
+            }
+        }
+    }
+}
+
+// ─── Transformer components ───────────────────────────────────────────────────
+
+struct TransformerWeights {
+    att_norm_w: Array1<f32>,  // RMSNorm  [D]
+    c_attn_w: Array2<f32>,    // Linear   [3D, D]  (no bias)
+    c_proj_w: Array2<f32>,    // Linear   [D, D]   (no bias)
+    ffn_norm_w: Array1<f32>,  // RMSNorm  [D]
+    fc1_w: Array2<f32>,       // Linear   [4D, D]  (no bias)
+    fc2_w: Array2<f32>,       // Linear   [D, 4D]  (no bias)
+}
+
+/// Single Transformer block (RMSNorm → Attention → RMSNorm → MLP), residual.
+///
+/// * `x`: \[T, D\]  (modified in-place conceptually; returns new array)
+fn transformer_block(x: ArrayView2<f32>, w: &TransformerWeights, n_heads: usize) -> Array2<f32> {
+    let (t, d) = (x.shape()[0], x.shape()[1]);
+    let head_dim = d / n_heads;
+
+    // ── Attention sub-layer ───────────────────────────────────────────────────
+    let normed = rms_norm(x, w.att_norm_w.view(), 1e-6);
+    // qkv: [T, 3D]  (no bias)
+    let qkv = linear(normed.view(), w.c_attn_w.view(), None);
+
+    // Split into Q, K, V each [T, D]
+    let q_flat = qkv.slice(s![.., 0..d]).to_owned();
+    let k_flat = qkv.slice(s![.., d..2 * d]).to_owned();
+    let v_flat = qkv.slice(s![.., 2 * d..]).to_owned();
+
+    // Reshape to [T, n_heads, head_dim]
+    let mut q = q_flat
+        .into_shape_with_order((t, n_heads, head_dim))
+        .expect("q reshape");
+    let mut k = k_flat
+        .into_shape_with_order((t, n_heads, head_dim))
+        .expect("k reshape");
+    let v = v_flat
+        .into_shape_with_order((t, n_heads, head_dim))
+        .expect("v reshape");
+
+    apply_rope(&mut q);
+    apply_rope(&mut k);
+
+    // Scaled dot-product attention per head
+    let scale = (head_dim as f32).sqrt().recip();
+    // attn_out: [T, n_heads, head_dim]
+    let mut attn_out = Array3::<f32>::zeros((t, n_heads, head_dim));
+
+    for h in 0..n_heads {
+        let qh = q.slice(s![.., h, ..]).to_owned(); // [T, head_dim]
+        let kh = k.slice(s![.., h, ..]).to_owned();
+        let vh = v.slice(s![.., h, ..]).to_owned();
+
+        // scores = qh @ kh.T * scale  →  [T, T]
+        let mut scores = qh.dot(&kh.t());
+        scores.mapv_inplace(|v| v * scale);
+
+        // softmax over last dim (per query row)
+        for ti in 0..t {
+            softmax_inplace(scores.slice_mut(s![ti, ..]).as_slice_mut().unwrap());
+        }
+
+        // weighted_v = scores @ vh  →  [T, head_dim]
+        let wv = scores.dot(&vh);
+        attn_out.slice_mut(s![.., h, ..]).assign(&wv);
+    }
+
+    // Reshape [T, n_heads, head_dim] → [T, D]
+    let attn_flat = attn_out
+        .into_shape_with_order((t, d))
+        .expect("attn out reshape");
+
+    // Project: c_proj (no bias)
+    let attn_proj = linear(attn_flat.view(), w.c_proj_w.view(), None);
+
+    // Residual
+    let x_attn = &x + &attn_proj;
+
+    // ── MLP sub-layer ─────────────────────────────────────────────────────────
+    let normed2 = rms_norm(x_attn.view(), w.ffn_norm_w.view(), 1e-6);
+    let h1 = linear(normed2.view(), w.fc1_w.view(), None);
+    let h1_act = h1.mapv(silu);
+    let h2 = linear(h1_act.view(), w.fc2_w.view(), None);
+
+    &x_attn + &h2
+}
+
+// ─── ResnetBlock ─────────────────────────────────────────────────────────────
+
+struct ResnetBlockWeights {
+    norm1_w: Array1<f32>, // GroupNorm [C]
+    norm1_b: Array1<f32>,
+    conv1_w: Array3<f32>, // Conv1d [C, C, 3]
+    conv1_b: Array1<f32>,
+    norm2_w: Array1<f32>,
+    norm2_b: Array1<f32>,
+    conv2_w: Array3<f32>, // Conv1d [C, C, 3]
+    conv2_b: Array1<f32>,
+}
+
+/// ResnetBlock: GroupNorm → swish → Conv1d(k=3) → GroupNorm → swish → Conv1d(k=3) + residual.
+///
+/// * `x`: \[C, T\]  (channels-first)
+fn resnet_block(x: ArrayView2<f32>, w: &ResnetBlockWeights) -> Array2<f32> {
+    // norm1 → swish → conv1
+    let h = group_norm(x, 32, w.norm1_w.view(), w.norm1_b.view(), 1e-6);
+    let h = h.mapv(silu);
+    let h = conv1d(h.view(), w.conv1_w.view(), Some(w.conv1_b.view()), 1);
+
+    // norm2 → swish → (dropout=no-op at inference) → conv2
+    let h = group_norm(h.view(), 32, w.norm2_w.view(), w.norm2_b.view(), 1e-6);
+    let h = h.mapv(silu);
+    let h = conv1d(h.view(), w.conv2_w.view(), Some(w.conv2_b.view()), 1);
+
+    // residual (in_channels == out_channels so no projection)
+    &x + &h
+}
+
+// ─── ISTFT ────────────────────────────────────────────────────────────────────
+
+/// Inverse STFT with "same" padding.
+///
+/// * `mag`: \[n_fft/2+1, T\]  real magnitudes
+/// * `phase`: \[n_fft/2+1, T\] real phase angles
+/// * `hop`: hop length (= n_fft / 4)
+/// * `window`: Hann window \[n_fft\]
+/// * returns: waveform \[T × hop\]
+fn istft(
+    mag: ArrayView2<f32>,
+    phase: ArrayView2<f32>,
+    hop: usize,
+    window: &[f32],
+) -> Vec<f32> {
+    let n_bins = mag.shape()[0]; // n_fft/2 + 1
+    let n_frames = mag.shape()[1];
+    let n_fft = (n_bins - 1) * 2;
+    debug_assert_eq!(n_fft, window.len());
+    debug_assert_eq!(hop, n_fft / 4);
+
+    let pad = (n_fft - hop) / 2; // "same" padding trim amount
+
+    // Output buffer (before trimming)
+    let out_size = (n_frames - 1) * hop + n_fft;
+    let mut y = vec![0.0f32; out_size];
+    let mut env = vec![0.0f32; out_size];
+
+    let mut planner = FftPlanner::<f32>::new();
+    let ifft = planner.plan_fft_inverse(n_fft);
+
+    let mut buf = vec![Complex::<f32>::default(); n_fft];
+
+    for ti in 0..n_frames {
+        // Build the complex spectrum from magnitude + phase
+        for fi in 0..n_bins {
+            let m = mag[[fi, ti]].min(1e2).exp();
+            let p = phase[[fi, ti]];
+            buf[fi] = Complex::new(m * p.cos(), m * p.sin());
+        }
+        // Hermitian symmetry: buf[n_fft - fi] = conj(buf[fi])  for fi in 1..n_bins-1
+        for fi in 1..n_bins - 1 {
+            buf[n_fft - fi] = buf[fi].conj();
+        }
+
+        // Inverse FFT (rustfft performs in-place, unnormalized)
+        ifft.process(&mut buf);
+
+        // Normalise + apply window, then overlap-add
+        let norm = n_fft as f32;
+        let offset = ti * hop;
+        for i in 0..n_fft {
+            let sample = buf[i].re / norm * window[i];
+            y[offset + i] += sample;
+            env[offset + i] += window[i] * window[i];
+        }
+    }
+
+    // Normalise by window envelope and trim same-padding
+    for i in 0..out_size {
+        if env[i] > 1e-11 {
+            y[i] /= env[i];
+        }
+    }
+
+    // Trim pad samples from each end (same-padding)
+    y[pad..out_size - pad].to_vec()
+}
+
+/// Hann window of length `n`.
+fn hann_window(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos()))
+        .collect()
+}
+
+// ─── Decoder weights ──────────────────────────────────────────────────────────
+
+struct DecoderWeights {
+    // FSQ
+    fsq_proj_w: Array2<f32>, // [2048, 8]
+    fsq_proj_b: Array1<f32>, // [2048]
+
+    // fc_post_a: Linear(2048, 1024)
+    fc_post_a_w: Array2<f32>, // [1024, 2048]
+    fc_post_a_b: Array1<f32>, // [1024]
+
+    // backbone.embed: Conv1d(1024, 1024, k=7, pad=3)
+    embed_w: Array3<f32>, // [1024, 1024, 7]
+    embed_b: Array1<f32>, // [1024]
+
+    // backbone.prior_net (2 ResnetBlocks)
+    prior_net: Vec<ResnetBlockWeights>,
+
+    // backbone.transformers (N TransformerBlocks)
+    transformers: Vec<TransformerWeights>,
+
+    // backbone.final_layer_norm: LayerNorm [D]
+    final_norm_w: Array1<f32>,
+    final_norm_b: Array1<f32>,
+
+    // backbone.post_net (2 ResnetBlocks)
+    post_net: Vec<ResnetBlockWeights>,
+
+    // head.out: Linear(D, n_fft+2)
+    head_w: Array2<f32>, // [n_fft+2, 1024]
+    head_b: Array1<f32>, // [n_fft+2]
+
+    // Hann window
+    window: Vec<f32>, // [n_fft]
+
+    // Detected hyper-parameters
+    hidden_dim: usize,
+    hop_length: usize,
+    depth: usize,
+    n_heads: usize,
+}
+
+fn load_resnet_block(st: &SafeTensors<'_>, prefix: &str, c: usize) -> Result<ResnetBlockWeights> {
+    Ok(ResnetBlockWeights {
+        norm1_w: as1d(load_f32(st, &format!("{prefix}.norm1.weight"))?, c),
+        norm1_b: as1d(load_f32(st, &format!("{prefix}.norm1.bias"))?, c),
+        conv1_w: as3d(load_f32(st, &format!("{prefix}.conv1.weight"))?, c, c, 3),
+        conv1_b: as1d(load_f32(st, &format!("{prefix}.conv1.bias"))?, c),
+        norm2_w: as1d(load_f32(st, &format!("{prefix}.norm2.weight"))?, c),
+        norm2_b: as1d(load_f32(st, &format!("{prefix}.norm2.bias"))?, c),
+        conv2_w: as3d(load_f32(st, &format!("{prefix}.conv2.weight"))?, c, c, 3),
+        conv2_b: as1d(load_f32(st, &format!("{prefix}.conv2.bias"))?, c),
+    })
+}
+
+fn load_transformer(st: &SafeTensors<'_>, prefix: &str, d: usize) -> Result<TransformerWeights> {
+    Ok(TransformerWeights {
+        att_norm_w: as1d(load_f32(st, &format!("{prefix}.att_norm.weight"))?, d),
+        c_attn_w: as2d(load_f32(st, &format!("{prefix}.att.c_attn.weight"))?, 3 * d, d),
+        c_proj_w: as2d(load_f32(st, &format!("{prefix}.att.c_proj.weight"))?, d, d),
+        ffn_norm_w: as1d(load_f32(st, &format!("{prefix}.ffn_norm.weight"))?, d),
+        fc1_w: as2d(load_f32(st, &format!("{prefix}.mlp.fc1.weight"))?, 4 * d, d),
+        fc2_w: as2d(load_f32(st, &format!("{prefix}.mlp.fc2.weight"))?, d, 4 * d),
+    })
+}
+
+fn load_decoder_weights(
+    st: &SafeTensors<'_>,
+    user_meta: &Option<std::collections::HashMap<String, String>>,
+) -> Result<DecoderWeights> {
+    // ── Auto-detect hyper-parameters from weight shapes ───────────────────────
+    let embed_shape = shape_of(st, "generator.backbone.embed.weight")?;
+    let hidden_dim = embed_shape[0]; // c_out
+
+    let head_shape = shape_of(st, "generator.head.out.weight")?;
+    let out_dim = head_shape[0];   // n_fft + 2
+    let hop_length = (out_dim - 2) / 4;
+
+    // Count transformer blocks by probing for weight keys
+    let depth = (0..64)
+        .take_while(|&i| {
+            st.tensor(&format!(
+                "generator.backbone.transformers.{i}.att_norm.weight"
+            ))
+            .is_ok()
+        })
+        .count();
+
+    if depth == 0 {
+        bail!("No transformer blocks found — is the safetensors file correct?");
+    }
+
+    // n_heads: read from safetensors __metadata__ if present, otherwise default to 16
+    let n_heads: usize = user_meta
+        .as_ref()
+        .and_then(|m| m.get("n_heads"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+
+    // FSQ codebook projection
+    // Try the nested key first (older exports), fall back to the flat key
+    let fsq_proj_key = if st.tensor("generator.quantizer.fsqs.0.project_out.weight").is_ok() {
+        "generator.quantizer.fsqs.0.project_out.weight"
+    } else {
+        "generator.quantizer.project_out.weight"
+    };
+    let fsq_bias_key = if st.tensor("generator.quantizer.fsqs.0.project_out.bias").is_ok() {
+        "generator.quantizer.fsqs.0.project_out.bias"
+    } else {
+        "generator.quantizer.project_out.bias"
+    };
+
+    let fsq_shape = shape_of(st, fsq_proj_key)?;
+    let fsq_out_dim = fsq_shape[0]; // 2048
+    let fsq_in_dim = fsq_shape[1];  // 8
+
+    let fsq_proj_w = as2d(
+        load_f32(st, fsq_proj_key)?,
+        fsq_out_dim,
+        fsq_in_dim,
+    );
+    let fsq_proj_b = as1d(
+        load_f32(st, fsq_bias_key)?,
+        fsq_out_dim,
+    );
+
+    // fc_post_a: [1024, 2048]
+    let fc_post_a_w = as2d(
+        load_f32(st, "fc_post_a.weight")?,
+        hidden_dim,
+        fsq_out_dim,
+    );
+    let fc_post_a_b = as1d(load_f32(st, "fc_post_a.bias")?, hidden_dim);
+
+    // backbone.embed Conv1d
+    let embed_k = embed_shape[2];
+    let embed_w = as3d(
+        load_f32(st, "generator.backbone.embed.weight")?,
+        hidden_dim,
+        hidden_dim,
+        embed_k,
+    );
+    let embed_b = as1d(
+        load_f32(st, "generator.backbone.embed.bias")?,
+        hidden_dim,
+    );
+
+    // prior_net (2 ResnetBlocks)
+    let prior_net = (0..2)
+        .map(|i| {
+            load_resnet_block(
+                st,
+                &format!("generator.backbone.prior_net.{i}"),
+                hidden_dim,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // transformers
+    let transformers = (0..depth)
+        .map(|i| {
+            load_transformer(
+                st,
+                &format!("generator.backbone.transformers.{i}"),
+                hidden_dim,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // final_layer_norm
+    let final_norm_w = as1d(
+        load_f32(st, "generator.backbone.final_layer_norm.weight")?,
+        hidden_dim,
+    );
+    let final_norm_b = as1d(
+        load_f32(st, "generator.backbone.final_layer_norm.bias")?,
+        hidden_dim,
+    );
+
+    // post_net (2 ResnetBlocks)
+    let post_net = (0..2)
+        .map(|i| {
+            load_resnet_block(
+                st,
+                &format!("generator.backbone.post_net.{i}"),
+                hidden_dim,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // head.out
+    let n_fft = hop_length * 4;
+    let head_w = as2d(
+        load_f32(st, "generator.head.out.weight")?,
+        out_dim,
+        hidden_dim,
+    );
+    let head_b = as1d(load_f32(st, "generator.head.out.bias")?, out_dim);
+
+    // Hann window: try to load from safetensors; compute as fallback
+    let window = if st.tensor("generator.head.istft.window").is_ok() {
+        load_f32(st, "generator.head.istft.window")?
+    } else {
+        hann_window(n_fft)
+    };
+
+    Ok(DecoderWeights {
+        fsq_proj_w,
+        fsq_proj_b,
+        fc_post_a_w,
+        fc_post_a_b,
+        embed_w,
+        embed_b,
+        prior_net,
+        transformers,
+        final_norm_w,
+        final_norm_b,
+        post_net,
+        head_w,
+        head_b,
+        window,
+        hidden_dim,
+        hop_length,
+        depth,
+        n_heads,
+    })
+}
+
+// ─── Decoder forward pass ─────────────────────────────────────────────────────
+
+fn decode_forward(codes: &[i32], w: &DecoderWeights) -> Vec<f32> {
+    let hop = w.hop_length;
+    let n_fft = hop * 4;
+    let embed_k = w.embed_w.shape()[2];
+    let embed_pad = embed_k / 2;
+
+    // 1. FSQ decode: [T] → [T, fsq_out_dim]
+    let emb = fsq_decode(codes, w.fsq_proj_w.view(), w.fsq_proj_b.view());
+
+    // 2. fc_post_a: [T, fsq_out_dim] → [T, hidden_dim]
+    let x = linear(emb.view(), w.fc_post_a_w.view(), Some(w.fc_post_a_b.view()));
+
+    // 3. backbone.embed Conv1d: [hidden_dim, T]
+    let x_ct = x.t().to_owned(); // [hidden_dim, T]
+    let x_ct = conv1d(
+        x_ct.view(),
+        w.embed_w.view(),
+        Some(w.embed_b.view()),
+        embed_pad,
+    );
+
+    // 4. prior_net (ResnetBlocks, channels-first)
+    let x_ct = w
+        .prior_net
+        .iter()
+        .fold(x_ct, |acc, rw| resnet_block(acc.view(), rw));
+
+    // 5. Transformers (sequence-first)
+    let x_tc = x_ct.t().to_owned(); // [T, hidden_dim]
+    let x_tc = w
+        .transformers
+        .iter()
+        .fold(x_tc, |acc, tw| transformer_block(acc.view(), tw, w.n_heads));
+
+    // 6. post_net (channels-first)
+    let x_ct = x_tc.t().to_owned(); // [hidden_dim, T]
+    let x_ct = w
+        .post_net
+        .iter()
+        .fold(x_ct, |acc, rw| resnet_block(acc.view(), rw));
+
+    // 7. final_layer_norm (sequence-first)
+    let x_tc = x_ct.t().to_owned(); // [T, hidden_dim]
+    let x_tc = layer_norm(
+        x_tc.view(),
+        w.final_norm_w.view(),
+        w.final_norm_b.view(),
+        1e-6,
+    );
+
+    // 8. head.out: [T, hidden_dim] → [T, n_fft+2]
+    let x_pred = linear(x_tc.view(), w.head_w.view(), Some(w.head_b.view()));
+
+    // 9. Transpose → [n_fft+2, T], split mag and phase
+    let x_pred_ct = x_pred.t().to_owned(); // [n_fft+2, T]
+    let half = (n_fft / 2) + 1; // n_bins = 641 for n_fft=1280, 961 for n_fft=1920
+    let mag = x_pred_ct.slice(s![0..half, ..]).to_owned();
+    let phase = x_pred_ct.slice(s![half.., ..]).to_owned();
+
+    // 10. ISTFT
+    istft(mag.view(), phase.view(), hop, &w.window)
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+/// Default path for the decoder safetensors weight file.
+fn default_decoder_path() -> PathBuf {
+    PathBuf::from("models/neucodec_decoder.safetensors")
+}
+
+/// NeuCodec decoder: converts speech token IDs to a 24 kHz audio waveform.
+///
+/// ## Setup
+///
+/// Obtain the weights once with:
+/// ```sh
+/// python scripts/convert_weights.py
+/// ```
+/// Then at runtime:
+/// ```rust,ignore
+/// let dec = NeuCodecDecoder::new()?;
+/// let audio = dec.decode(&codes)?;
+/// ```
 pub struct NeuCodecDecoder {
-    session: Mutex<Session>,
+    weights: DecoderWeights,
+    path: PathBuf,
 }
 
 impl NeuCodecDecoder {
-    /// Load the decoder from an ONNX file on disk.
-    pub fn load(model_path: &Path) -> Result<Self> {
-        let session = Session::builder()
-            .context("Failed to create ORT session builder")?
-            .commit_from_file(model_path)
-            .with_context(|| format!("Cannot load ONNX codec: {}", model_path.display()))?;
-        Ok(Self { session: Mutex::new(session) })
+    /// Load from the default path (`models/neucodec_decoder.safetensors`).
+    pub fn new() -> Result<Self> {
+        Self::from_file(&default_decoder_path())
     }
 
-    /// Decode a sequence of NeuCodec token IDs to a mono audio waveform.
+    /// Load from an explicit file path.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            bail!(
+                "NeuCodec decoder weights not found: {}\n\
+                 \n\
+                 Run the one-time conversion to generate them:\n\
+                 \n\
+                 \tpython scripts/convert_weights.py\n\
+                 \n\
+                 Or set a custom path with NeuCodecDecoder::from_file().",
+                path.display()
+            );
+        }
+
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+
+        // Read user-defined metadata (n_heads, depth, etc.) from the file header
+        let (_, file_meta) = SafeTensors::read_metadata(&bytes)
+            .with_context(|| format!("Failed to parse safetensors header: {}", path.display()))?;
+        let user_meta = file_meta.metadata().clone();
+
+        let st = SafeTensors::deserialize(&bytes)
+            .with_context(|| format!("Failed to parse safetensors: {}", path.display()))?;
+
+        let weights = load_decoder_weights(&st, &user_meta)
+            .with_context(|| format!("Failed to load decoder weights from {}", path.display()))?;
+
+        println!(
+            "NeuCodec decoder: hidden={}, depth={}, heads={}, hop={} ({} samples/token = {} tokens/s)",
+            weights.hidden_dim,
+            weights.depth,
+            weights.n_heads,
+            weights.hop_length,
+            weights.hop_length,
+            SAMPLE_RATE as usize / weights.hop_length,
+        );
+
+        Ok(Self {
+            weights,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Decode speech token IDs to a 24 kHz audio waveform.
     ///
-    /// `codes` — integer token IDs in the range `[0, 1023]`.
-    ///
-    /// Returns a flat `Vec<f32>` at [`SAMPLE_RATE`] Hz (24 kHz).
+    /// * `codes` — integer token IDs (typically 0..65535 for NeuCodec FSQ).
+    /// * returns — `Vec<f32>` of `codes.len() × hop_length` samples.
     pub fn decode(&self, codes: &[i32]) -> Result<Vec<f32>> {
         if codes.is_empty() {
             return Ok(Vec::new());
         }
-        let seq_len = codes.len();
+        Ok(decode_forward(codes, &self.weights))
+    }
 
-        // Build input tensor: shape [1, 1, T], dtype int32.
-        let t_codes = Tensor::<i32>::from_array((
-            [1usize, 1usize, seq_len],
-            codes.to_vec(),
-        ))
-        .context("Failed to build codes tensor")?;
+    /// Name of the active inference backend (always `"cpu"` for this build).
+    pub fn backend_name(&self) -> &str {
+        "cpu (ndarray)"
+    }
 
-        // Run inference.
-        let mut session = self.session.lock().expect("ORT session mutex poisoned");
-        let outputs = session
-            .run(ort::inputs![t_codes])
-            .context("NeuCodec ONNX inference failed")?;
+    /// Alias for [`from_file`](Self::from_file) — load from an explicit path.
+    pub fn load(path: &Path) -> Result<Self> {
+        Self::from_file(path)
+    }
 
-        // Output 0: audio waveform (shape [1, 1, T_audio] or [1, T_audio] or [T_audio]).
-        let (_shape, audio_data) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .context("Failed to extract audio tensor from codec output")?;
+    /// Path from which the decoder was loaded.
+    pub fn weights_path(&self) -> &Path {
+        &self.path
+    }
 
-        Ok(audio_data.to_vec())
+    /// Detected `hop_length` (audio samples per speech token).
+    pub fn hop_length(&self) -> usize {
+        self.weights.hop_length
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Encoder (stub) ───────────────────────────────────────────────────────────
+
+/// NeuCodec encoder: converts a 16 kHz audio waveform to speech token IDs.
+///
+/// **Note**: The full NeuCodec encoder requires Wav2Vec2BertModel (~600 MB)
+/// as a semantic feature extractor.  Encoder support is not yet implemented
+/// in this pure-Rust build.
+///
+/// For reference audio encoding, use the Python `neucodec` package:
+/// ```python
+/// from neucodec import NeuCodec
+/// model = NeuCodec.from_pretrained("neuphonic/neucodec")
+/// codes = model.encode_code(waveform)   # → i32 array
+/// ```
+/// Then save the codes as a `.npy` file and pass via `--ref-codes` to the
+/// synthesis examples.
+pub struct NeuCodecEncoder;
+
+impl NeuCodecEncoder {
+    /// Always returns an error — encoder not yet implemented.
+    pub fn new() -> Result<Self> {
+        bail!(
+            "The NeuCodec encoder is not yet implemented in the pure-Rust build.\n\
+             \n\
+             To encode reference audio, use the Python neucodec package:\n\
+             \n\
+             \tpip install neucodec huggingface_hub\n\
+             \tpython scripts/encode_reference.py --audio reference.wav --out ref.npy\n\
+             \n\
+             Then pass the .npy file via --ref-codes to the synthesis examples."
+        )
+    }
+
+    /// Always returns an error — encoder not yet implemented.
+    pub fn load(_path: &Path) -> Result<Self> {
+        Self::new()
+    }
+
+    /// Encode a WAV file to speech token IDs (not implemented).
+    pub fn encode_wav(&self, _path: &Path) -> Result<Vec<i32>> {
+        bail!("Encoder not implemented — see NeuCodecEncoder docs")
+    }
+
+    /// Backend name.
+    pub fn backend_name(&self) -> &str {
+        "not available"
+    }
+}
+
+// ─── Resample helper ──────────────────────────────────────────────────────────
+
+/// Naive linear resampler: changes sample rate of `samples` from `from_hz` to `to_hz`.
+pub fn resample(samples: &[f32], from_hz: u32, to_hz: u32) -> Vec<f32> {
+    if from_hz == to_hz {
+        return samples.to_vec();
+    }
+    let ratio = from_hz as f64 / to_hz as f64;
+    let out_len = (samples.len() as f64 / ratio).ceil() as usize;
+    (0..out_len)
+        .map(|i| {
+            let src = i as f64 * ratio;
+            let lo = src.floor() as usize;
+            let hi = (lo + 1).min(samples.len() - 1);
+            let frac = (src - lo as f64) as f32;
+            samples[lo] * (1.0 - frac) + samples[hi] * frac
+        })
+        .collect()
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_sample_rate() {
-        assert_eq!(SAMPLE_RATE, 24_000);
+    fn test_fsq_decode_shape() {
+        // Minimal project_out: 4-dim output, 8-dim input
+        let w = Array2::ones((4, 8));
+        let b = Array1::zeros(4);
+        let codes = vec![0i32, 1, 2, 65535];
+        let out = fsq_decode(&codes, w.view(), b.view());
+        assert_eq!(out.shape(), &[4, 4]);
+    }
+
+    #[test]
+    fn test_fsq_code_0() {
+        // Code 0 → all digits 0 → all scaled to -1.0
+        // project_out identity (8×8)
+        let w = Array2::eye(8);
+        let b = Array1::zeros(8);
+        let out = fsq_decode(&[0], w.view(), b.view());
+        for v in out.iter() {
+            assert!((*v + 1.0).abs() < 1e-5, "expected -1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_fsq_code_max() {
+        // Code 65535 = 4^8 - 1 → all digits 3 → all scaled to 1.0
+        let w = Array2::eye(8);
+        let b = Array1::zeros(8);
+        let out = fsq_decode(&[65535], w.view(), b.view());
+        for v in out.iter() {
+            assert!((*v - 1.0).abs() < 1e-5, "expected 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_linear_shape() {
+        let x = Array2::ones((5, 3));
+        let w = Array2::ones((7, 3));
+        let b = Array1::zeros(7);
+        let out = linear(x.view(), w.view(), Some(b.view()));
+        assert_eq!(out.shape(), &[5, 7]);
+    }
+
+    #[test]
+    fn test_conv1d_same_length() {
+        let c_in = 4;
+        let c_out = 8;
+        let t = 16;
+        let k = 3;
+        let x = Array2::ones((c_in, t));
+        let w = Array3::ones((c_out, c_in, k));
+        let b = Array1::zeros(c_out);
+        let out = conv1d(x.view(), w.view(), Some(b.view()), 1);
+        assert_eq!(out.shape(), &[c_out, t]); // same length
+    }
+
+    #[test]
+    fn test_group_norm_shape() {
+        let c = 64;
+        let t = 10;
+        let x = Array2::ones((c, t));
+        let w = Array1::ones(c);
+        let b = Array1::zeros(c);
+        let out = group_norm(x.view(), 4, w.view(), b.view(), 1e-6);
+        assert_eq!(out.shape(), &[c, t]);
+        // All-ones input → mean 1, var 0 → norm 0*w + b = 0
+        for &v in out.iter() {
+            assert!(v.abs() < 1e-4, "expected ~0 after group_norm of all-ones, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_layer_norm_shape() {
+        let t = 5;
+        let c = 32;
+        let x = Array2::from_elem((t, c), 2.0f32);
+        let w = Array1::ones(c);
+        let b = Array1::zeros(c);
+        let out = layer_norm(x.view(), w.view(), b.view(), 1e-6);
+        assert_eq!(out.shape(), &[t, c]);
+        // Constant input → LayerNorm output is 0
+        for &v in out.iter() {
+            assert!(v.abs() < 1e-4, "expected ~0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_rms_norm_shape() {
+        let t = 3;
+        let c = 8;
+        let x = Array2::ones((t, c));
+        let w = Array1::ones(c);
+        let out = rms_norm(x.view(), w.view(), 1e-6);
+        assert_eq!(out.shape(), &[t, c]);
+        // RMSNorm of all-ones → 1/rms(1) * 1 = 1
+        for &v in out.iter() {
+            assert!((v - 1.0).abs() < 1e-4, "expected 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_rope_shape_preserved() {
+        let t = 4;
+        let n_heads = 2;
+        let head_dim = 8;
+        let mut x = Array3::ones((t, n_heads, head_dim));
+        apply_rope(&mut x);
+        assert_eq!(x.shape(), &[t, n_heads, head_dim]);
+    }
+
+    #[test]
+    fn test_hann_window() {
+        let w = hann_window(4);
+        assert_eq!(w.len(), 4);
+        // Hann window: w[0] = 0, w[n/2] = 1, w[n] = 0
+        assert!(w[0].abs() < 1e-6);
+        assert!((w[2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_istft_length() {
+        let hop = 4;
+        let n_fft = 16; // hop * 4
+        let t = 10;
+        let n_bins = n_fft / 2 + 1; // 9
+        let mag = Array2::zeros((n_bins, t));
+        let phase = Array2::zeros((n_bins, t));
+        let win = hann_window(n_fft);
+        let audio = istft(mag.view(), phase.view(), hop, &win);
+        // Expected: t * hop samples
+        assert_eq!(audio.len(), t * hop, "expected {} samples, got {}", t * hop, audio.len());
+    }
+
+    #[test]
+    fn test_wgpu_feature_fn() {
+        // Just verify it compiles and returns a bool
+        let _ = wgpu_feature_enabled();
+    }
+
+    #[test]
+    fn test_resample_identity() {
+        let s: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let r = resample(&s, 16_000, 16_000);
+        assert_eq!(r, s);
     }
 }

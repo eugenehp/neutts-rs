@@ -1,96 +1,54 @@
 //! # neutts
 //!
 //! Rust port of [NeuTTS](https://github.com/neuphonic/neutts) —
-//! an on-device voice-cloning TTS system based on a GGUF LLM backbone
-//! and the NeuCodec neural audio codec.
+//! an on-device voice-cloning TTS system built on a GGUF LLM backbone and
+//! the NeuCodec neural audio codec (pure-Rust CPU inference, no ONNX Runtime).
 //!
 //! ## Architecture
 //!
-//! The synthesis pipeline has two models:
+//! ```text
+//!  text  ──► espeak-ng ──► IPA ──► GGUF backbone ──► speech tokens ──► NeuCodec decoder ──► audio
+//!                               +  ref codes ──►
+//! ```
 //!
-//! 1. **GGUF backbone** — a small causal LM (NeuTTS-Nano or NeuTTS-Air in GGUF
-//!    format) that takes a text prompt and pre-encoded reference codes and
-//!    generates speech token IDs.
-//! 2. **NeuCodec ONNX decoder** — decodes speech token IDs back to a 24 kHz
-//!    audio waveform.
+//! 1. **GGUF backbone** (`llama-cpp-2`) — a small causal LM that generates speech token IDs.
+//! 2. **NeuCodec decoder** — pure-Rust FSQ+Vocos+ISTFT decoder; 24 kHz output.
+//!
+//! ## One-time setup
+//!
+//! ```sh
+//! pip install torch huggingface_hub safetensors
+//! python scripts/convert_weights.py     # download + extract decoder weights
+//! cargo build                           # codec weights loaded at runtime
+//! ```
 //!
 //! ## Quick start
 //!
 //! ```ignore
-//! // Requires features: backbone, espeak
 //! use neutts::{NeuTTS, download};
 //! use std::path::Path;
 //!
-//! // Download backbone + codec from HuggingFace (cached after first run)
-//! let tts = download::load_from_hub(
-//!     "neuphonic/neutts-nano-q4-gguf",
-//!     "neuphonic/neucodec-onnx-decoder",
-//! ).unwrap();
-//!
-//! // Load pre-encoded reference codes (Vec<i32>, obtained offline with Python)
+//! let tts = download::load_from_hub("neuphonic/neutts-nano-q4-gguf").unwrap();
 //! let ref_codes = tts.load_ref_codes(Path::new("samples/jo.npy")).unwrap();
-//! let ref_text  = "We are testing this model today.";
-//!
-//! // Generate audio (Vec<f32>, 24 kHz mono)
-//! let audio = tts.infer("Hello from Rust!", &ref_codes, ref_text).unwrap();
-//!
-//! // Save to WAV
+//! let audio = tts.infer("Hello from Rust!", &ref_codes, "Reference transcript.").unwrap();
 //! tts.write_wav(&audio, Path::new("output.wav")).unwrap();
 //! ```
 //!
-//! ## Pre-encoding reference audio
-//!
-//! The reference codes must be encoded with the NeuCodec encoder, which is
-//! currently only available via the Python package:
-//!
-//! ```python
-//! from neutts import NeuTTS
-//! import numpy as np
-//!
-//! tts = NeuTTS(codec_repo="neuphonic/neucodec")
-//! codes = tts.encode_reference("reference.wav")   # tensor of i32 values
-//! np.save("ref_codes.npy", codes.numpy().astype("int32"))
-//! ```
-//!
-//! Pass the saved `.npy` path to [`NeuTTS::load_ref_codes`].
-//!
-//! ## Text input without espeak
-//!
-//! When the `espeak` feature is disabled, pass pre-phonemized IPA directly:
-//!
-//! ```ignore
-//! // Requires feature: backbone
-//! # use neutts::{NeuTTS, download};
-//! # use std::path::Path;
-//! # let tts = download::load_from_hub("neuphonic/neutts-nano-q4-gguf", "neuphonic/neucodec-onnx-decoder").unwrap();
-//! # let ref_codes = tts.load_ref_codes(Path::new("samples/jo.npy")).unwrap();
-//! // IPA obtained from an external source (e.g. a server, pre-built table, etc.)
-//! let ref_ipa   = "wɪ ɑːɹ tɛstɪŋ ðɪs mɑːdl̩ tədeɪ";
-//! let input_ipa = "hɛloʊ fɹʌm ɹʌst";
-//! let audio = tts.infer_from_ipa(input_ipa, &ref_codes, ref_ipa).unwrap();
-//! ```
-//!
-//! ## Build requirements
-//!
-//! | Platform       | Backbone            | Codec (ort)     | Phonemizer (espeak)        |
-//! |----------------|---------------------|-----------------|----------------------------|
-//! | Linux / macOS  | cmake + C++ (auto)  | auto-downloaded | `apt install libespeak-ng-dev` / `brew install espeak-ng` |
-//! | iOS / Android  | cross-compile llama.cpp | bundled .a  | cross-compile espeak-ng; set `ESPEAK_LIB_DIR` |
-//!
 //! ## Features
 //!
-//! | Feature    | Default | Effect                                                      |
-//! |------------|---------|-------------------------------------------------------------|
-//! | `backbone` | ✓       | Enables GGUF backbone via llama-cpp-2 (requires cmake + C++) |
-//! | `espeak`   |         | Enables raw-text input via libespeak-ng                     |
-//! | `metal`    |         | macOS Metal GPU acceleration (backbone)                     |
-//! | `cuda`     |         | NVIDIA CUDA acceleration (backbone)                         |
+//! | Feature    | Default | Effect                                                          |
+//! |------------|---------|-----------------------------------------------------------------|
+//! | `backbone` | ✓       | GGUF backbone via llama-cpp-2 (requires cmake + C++)            |
+//! | `espeak`   |         | Raw-text input via libespeak-ng                                 |
+//! | `wgpu`     |         | Reserved for future GPU codec acceleration (currently no-op)    |
+//! | `metal`    |         | macOS Metal GPU for backbone                                    |
+//! | `cuda`     |         | NVIDIA CUDA for backbone                                        |
 
 // HuggingFace Hub download — desktop only (hf-hub needs OpenSSL).
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub mod download;
 
-// C FFI for iOS / Android.
+pub mod cache;
 pub mod ffi;
 
 #[cfg(feature = "backbone")]
@@ -105,8 +63,29 @@ pub mod tokens;
 
 // ─── Re-exports ───────────────────────────────────────────────────────────────
 
-/// The main TTS handle — see [`download::load_from_hub`] to create one.
+/// The main TTS handle.
 pub use model::NeuTTS;
 
-/// Audio sample rate produced by NeuCodec.
+/// Disk cache for pre-encoded reference codes, keyed by SHA-256 of the WAV.
+pub use cache::RefCodeCache;
+
+/// Result of a [`RefCodeCache`] lookup.
+pub use cache::CacheOutcome;
+
+/// NeuCodec encoder stub (encoder not yet implemented in pure-Rust build).
+pub use codec::NeuCodecEncoder;
+
+/// NeuCodec decoder — converts speech token IDs to 24 kHz audio.
+pub use codec::NeuCodecDecoder;
+
+/// Decoder output sample rate (24 000 Hz).
 pub use codec::SAMPLE_RATE;
+
+/// Encoder input sample rate (16 000 Hz).
+pub use codec::ENCODER_SAMPLE_RATE;
+
+/// Decoder: audio samples per token (hop_length, nominally 480 = 24 000 / 50).
+pub use codec::SAMPLES_PER_TOKEN;
+
+/// Encoder: audio samples consumed per token (320 = 16 000 / 50).
+pub use codec::ENCODER_SAMPLES_PER_TOKEN;

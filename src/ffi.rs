@@ -9,16 +9,20 @@
 //! | Function                          | Caller frees with          |
 //! |-----------------------------------|----------------------------|
 //! | [`neutts_model_load`]             | [`neutts_model_free`]      |
-//! | [`neutts_decode_tokens`]          | caller's own buffer        |
-//! | [`neutts_synthesize_to_file`]     | [`neutts_free_error`]      |
+//! | [`neutts_decode_tokens`]          | [`neutts_free_audio`]      |
+//! | [`neutts_write_wav`]              | [`neutts_free_error`]      |
 //!
 //! ## Mobile workflow
 //!
-//! On mobile the backbone typically runs server-side.  Only the NeuCodec ONNX
-//! decoder is bundled with the app:
+//! The NeuCodec decoder uses the [Burn](https://burn.dev) ML framework — no
+//! ONNX Runtime needed at runtime.  On mobile the backbone typically runs
+//! server-side; only the Burn decoder is bundled with the app:
 //!
 //! 1. Call [`neutts_set_espeak_data_path`] (if espeak is bundled).
-//! 2. Load the model with [`neutts_model_load`].
+//! 2. Load the model with [`neutts_model_load`], passing the path to a Burn
+//!    binary record (`.bin`) file.  If the weights are embedded in the binary
+//!    (default when built with `cargo build` after `download_models`), pass
+//!    an empty string and [`NeuCodecDecoder::new`] is used instead.
 //! 3. For each utterance, receive speech token IDs from the server and call
 //!    [`neutts_decode_tokens`] to get audio, then write it to a WAV with
 //!    [`neutts_write_wav`].
@@ -69,18 +73,24 @@ pub unsafe extern "C" fn neutts_set_espeak_data_path(path: *const c_char) {
     }
 }
 
-/// Load a NeuCodec ONNX decoder from disk.
+/// Load a NeuCodec Burn decoder.
 ///
-/// @param onnx_path  UTF-8 path to the NeuCodec ONNX model file.
-/// @return           Opaque handle, or `NULL` on failure (details to stderr).
-///                   Free with [`neutts_model_free`].
+/// @param weights_path  UTF-8 path to a Burn binary record (`.bin`) file, or
+///                      an empty string / NULL to use the weights compiled into
+///                      the binary (requires `burn_decoder_available` build flag).
+/// @return              Opaque handle, or `NULL` on failure (details to stderr).
+///                      Free with [`neutts_model_free`].
 #[no_mangle]
-pub unsafe extern "C" fn neutts_model_load(onnx_path: *const c_char) -> *mut NeuTtsHandle {
-    let Some(path) = (unsafe { cstr_to_string(onnx_path) }) else {
-        eprintln!("[neutts] neutts_model_load: null onnx_path");
-        return std::ptr::null_mut();
+pub unsafe extern "C" fn neutts_model_load(weights_path: *const c_char) -> *mut NeuTtsHandle {
+    let path_opt = unsafe { cstr_to_string(weights_path) }
+        .filter(|s| !s.is_empty());
+
+    let result = match path_opt {
+        Some(ref p) => NeuCodecDecoder::load(Path::new(p)),
+        None        => NeuCodecDecoder::new(),
     };
-    match NeuCodecDecoder::load(Path::new(&path)) {
+
+    match result {
         Ok(codec) => Box::into_raw(Box::new(NeuTtsHandle { codec })),
         Err(e) => {
             eprintln!("[neutts] load error: {e:#}");

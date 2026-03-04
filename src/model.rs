@@ -1,4 +1,4 @@
-//! NeuTTS model — ties the GGUF backbone and NeuCodec ONNX decoder together.
+//! NeuTTS model — ties the GGUF backbone and NeuCodec Burn decoder together.
 //!
 //! ## Pipeline
 //!
@@ -16,7 +16,7 @@
 //!            └──────────────────────┬────────────────┘
 //!                                   │ speech token IDs
 //!            ┌──────────────────────▼────────────────┐
-//!            │  NeuCodec ONNX decoder                │
+//!            │  NeuCodec Burn decoder                │
 //!            └──────────────────────┬────────────────┘
 //!                                   │ audio (Vec<f32>, 24 kHz)
 //! ```
@@ -25,7 +25,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::codec::{NeuCodecDecoder, SAMPLE_RATE};
+use crate::codec::{NeuCodecDecoder, NeuCodecEncoder, SAMPLE_RATE};
 use crate::npy;
 
 #[cfg(feature = "backbone")]
@@ -68,7 +68,7 @@ pub struct NeuTTS {
     #[cfg(feature = "backbone")]
     pub backbone: BackboneModel,
 
-    /// NeuCodec ONNX decoder — converts speech token IDs to audio.
+    /// NeuCodec Burn decoder — converts speech token IDs to audio.
     pub codec: NeuCodecDecoder,
 
     /// espeak-ng language code (e.g. `"en-us"`, `"de"`, `"fr-fr"`, `"es"`).
@@ -87,18 +87,20 @@ impl NeuTTS {
     ///
     /// * `backbone_path` — Path to a NeuTTS GGUF model file.
     ///   **Requires the `backbone` Cargo feature.**
-    /// * `codec_path`    — Path to the NeuCodec ONNX decoder file.
     /// * `language`      — espeak-ng language code (e.g. `"en-us"`).
     ///   Used only when the `espeak` feature is enabled.
+    ///
+    /// The Burn codec decoder uses the weights compiled into the binary (from
+    /// the build-time ONNX conversion).  No codec path is needed at runtime.
     #[cfg(feature = "backbone")]
-    pub fn load(backbone_path: &Path, codec_path: &Path, language: &str) -> Result<Self> {
+    pub fn load(backbone_path: &Path, language: &str) -> Result<Self> {
         println!("Loading backbone: {}", backbone_path.display());
         let backbone = BackboneModel::load(backbone_path, DEFAULT_N_CTX)
             .context("Failed to load backbone")?;
 
-        println!("Loading codec: {}", codec_path.display());
-        let codec = NeuCodecDecoder::load(codec_path)
-            .context("Failed to load NeuCodec ONNX decoder")?;
+        println!("Initialising NeuCodec Burn decoder…");
+        let codec = NeuCodecDecoder::new()
+            .context("Failed to initialise NeuCodec Burn decoder")?;
 
         Ok(Self {
             backbone,
@@ -111,14 +113,12 @@ impl NeuTTS {
     /// Load NeuTTS with only the codec (no backbone).
     ///
     /// Use this when you already have generated speech token IDs and only need
-    /// the ONNX decoder step (e.g. on mobile where the backbone is called
+    /// the Burn decoder step (e.g. on mobile where the backbone is called
     /// server-side).
-    ///
-    /// When the `backbone` feature is enabled, use [`NeuTTS::load`] instead.
     #[cfg(not(feature = "backbone"))]
-    pub fn load_codec_only(codec_path: &Path) -> Result<Self> {
-        let codec = NeuCodecDecoder::load(codec_path)
-            .context("Failed to load NeuCodec ONNX decoder")?;
+    pub fn load_codec_only() -> Result<Self> {
+        let codec = NeuCodecDecoder::new()
+            .context("Failed to initialise NeuCodec Burn decoder")?;
         Ok(Self {
             codec,
             language: "en-us".to_string(),
@@ -126,20 +126,27 @@ impl NeuTTS {
         })
     }
 
-    // ── Reference code loading ────────────────────────────────────────────────
+    // ── Reference code loading / saving ──────────────────────────────────────
 
     /// Load pre-encoded NeuCodec reference codes from a `.npy` file.
-    ///
-    /// The NPY file should contain a 1-D int32 array of codec token IDs (values
-    /// 0–1023), saved with:
-    ///
-    /// ```python
-    /// import numpy as np
-    /// np.save("ref_codes.npy", tts.encode_reference("ref.wav").numpy().astype("int32"))
-    /// ```
     pub fn load_ref_codes(&self, path: &Path) -> Result<Vec<i32>> {
         npy::load_npy_i32(path)
             .with_context(|| format!("Failed to load reference codes: {}", path.display()))
+    }
+
+    /// Encode a reference WAV file to NeuCodec token IDs.
+    ///
+    /// `encoder` is obtained from [`crate::download::load_encoder`] or
+    /// [`NeuCodecEncoder::new`].
+    pub fn encode_reference(&self, wav_path: &Path, encoder: &NeuCodecEncoder) -> Result<Vec<i32>> {
+        encoder.encode_wav(wav_path)
+            .with_context(|| format!("Failed to encode reference audio: {}", wav_path.display()))
+    }
+
+    /// Save pre-encoded NeuCodec reference codes to a `.npy` file.
+    pub fn save_ref_codes(&self, codes: &[i32], path: &Path) -> Result<()> {
+        npy::write_npy_i32(path, codes)
+            .with_context(|| format!("Failed to save reference codes: {}", path.display()))
     }
 
     // ── Synthesis ─────────────────────────────────────────────────────────────
@@ -147,19 +154,9 @@ impl NeuTTS {
     /// Generate audio from `text` using `ref_codes` and `ref_text` for voice
     /// cloning.
     ///
-    /// Phonemises both `text` and `ref_text` with espeak-ng, builds the prompt,
-    /// runs the GGUF backbone, decodes speech tokens with NeuCodec.
-    ///
     /// **Requires both the `backbone` and `espeak` Cargo features.**
     ///
     /// Returns a flat `Vec<f32>` at [`SAMPLE_RATE`] Hz (24 kHz, mono).
-    ///
-    /// # Arguments
-    ///
-    /// * `text`      — The utterance to synthesise.
-    /// * `ref_codes` — Pre-encoded NeuCodec codes of the reference audio
-    ///                 (see [`load_ref_codes`](Self::load_ref_codes)).
-    /// * `ref_text`  — Transcript of the reference audio (used for voice cloning).
     #[cfg(all(feature = "backbone", feature = "espeak"))]
     pub fn infer(&self, text: &str, ref_codes: &[i32], ref_text: &str) -> Result<Vec<f32>> {
         let ref_phones   = phonemize::phonemize(ref_text, &self.language)
@@ -172,16 +169,7 @@ impl NeuTTS {
 
     /// Generate audio from pre-phonemized IPA strings.
     ///
-    /// Use this when espeak-ng is unavailable or when you want to supply IPA
-    /// from a different G2P pipeline.
-    ///
     /// **Requires the `backbone` Cargo feature.**
-    ///
-    /// # Arguments
-    ///
-    /// * `input_ipa` — IPA phonemes for the text to synthesise.
-    /// * `ref_codes` — Pre-encoded NeuCodec codes for the reference speaker.
-    /// * `ref_ipa`   — IPA phonemes for the reference audio transcript.
     #[cfg(feature = "backbone")]
     pub fn infer_from_ipa(
         &self,
@@ -208,9 +196,9 @@ impl NeuTTS {
             );
         }
 
-        // Decode with NeuCodec.
+        // Decode with NeuCodec Burn decoder.
         self.codec.decode(&speech_ids)
-            .context("NeuCodec decode failed")
+            .context("NeuCodec Burn decode failed")
     }
 
     /// Decode a pre-generated sequence of speech token IDs directly to audio.
@@ -218,15 +206,12 @@ impl NeuTTS {
     /// This is the mobile / streaming path: the backbone runs server-side and
     /// the client only calls the codec.
     pub fn decode_tokens(&self, speech_ids: &[i32]) -> Result<Vec<f32>> {
-        self.codec.decode(speech_ids).context("NeuCodec decode failed")
+        self.codec.decode(speech_ids).context("NeuCodec Burn decode failed")
     }
 
     // ── WAV output ────────────────────────────────────────────────────────────
 
     /// Write `audio` samples to a 16-bit PCM WAV file at [`SAMPLE_RATE`] Hz.
-    ///
-    /// 16-bit PCM is used for maximum compatibility (Android `MediaPlayer`
-    /// does not reliably handle IEEE-float WAV at runtime).
     pub fn write_wav(&self, audio: &[f32], output_path: &Path) -> Result<()> {
         let spec = hound::WavSpec {
             channels: 1,

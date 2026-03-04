@@ -206,6 +206,43 @@ pub fn load_npy_i32(path: &Path) -> Result<Vec<i32>> {
     load_npy(path)?.into_i32()
 }
 
+/// Write a 1-D `int32` array to a `.npy` file.
+///
+/// Produces a valid NPY v1.0 file with dtype `<i4` (little-endian int32) and
+/// C-contiguous layout, identical to:
+///
+/// ```python
+/// import numpy as np
+/// np.save("ref_codes.npy", array.astype("int32"))
+/// ```
+///
+/// The file can be loaded back with [`load_npy_i32`].
+pub fn write_npy_i32(path: &Path, data: &[i32]) -> Result<()> {
+    let header_str = format!(
+        "{{'descr': '<i4', 'fortran_order': False, 'shape': ({},), }}",
+        data.len()
+    );
+    // Pad header to a multiple of 64 bytes (NPY spec §2.1).
+    let raw_len    = header_str.len() + 1; // +1 for trailing '\n'
+    let padded_len = ((raw_len + 63) / 64) * 64;
+    let pad        = padded_len - raw_len;
+    let mut header = header_str;
+    for _ in 0..pad { header.push(' '); }
+    header.push('\n');
+
+    let mut buf = Vec::with_capacity(10 + header.len() + data.len() * 4);
+    buf.extend_from_slice(b"\x93NUMPY");
+    buf.push(1); buf.push(0); // version 1.0
+    buf.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    buf.extend_from_slice(header.as_bytes());
+    for &v in data {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    std::fs::write(path, &buf)
+        .with_context(|| format!("Cannot write NPY: {}", path.display()))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // NPZ loader (ZIP of NPY files) — used for multi-array archives
 // ─────────────────────────────────────────────────────────────────────────────

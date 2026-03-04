@@ -1,21 +1,26 @@
 //! HuggingFace Hub model downloader.
 //!
-//! Downloads (or reuses cached copies of) the GGUF backbone and the NeuCodec
-//! ONNX decoder from HuggingFace, then constructs and returns a [`NeuTTS`].
+//! Downloads (or reuses cached copies of) the GGUF backbone from HuggingFace,
+//! then constructs and returns a [`NeuTTS`].
+//!
+//! The **NeuCodec codec** is compiled into the binary at build time (via
+//! `burn-import` in `build.rs`) — no runtime ONNX download is needed for the
+//! decoder.  The encoder ONNX file can be downloaded with [`load_encoder`] for
+//! reference audio encoding.
 //!
 //! Files are cached under `~/.cache/huggingface/hub`; subsequent calls return
 //! immediately from cache without a network request.
 //!
 //! ## Default models
 //!
-//! | Name                | HuggingFace repo                                  |
-//! |---------------------|---------------------------------------------------|
-//! | NeuTTS-Nano Q4      | `neuphonic/neutts-nano-q4-gguf`                   |
-//! | NeuTTS-Nano Q8      | `neuphonic/neutts-nano-q8-gguf`                   |
-//! | NeuTTS-Air Q4       | `neuphonic/neutts-air-q4-gguf`                    |
-//! | NeuTTS-Air Q8       | `neuphonic/neutts-air-q8-gguf`                    |
-//! | NeuCodec Decoder    | `neuphonic/neucodec-onnx-decoder`                 |
-//! | NeuCodec Dec. (int8)| `neuphonic/neucodec-onnx-decoder-int8`            |
+//! | Name                | HuggingFace repo                        |
+//! |---------------------|-----------------------------------------|
+//! | NeuTTS-Nano Q4      | `neuphonic/neutts-nano-q4-gguf`         |
+//! | NeuTTS-Nano Q8      | `neuphonic/neutts-nano-q8-gguf`         |
+//! | NeuTTS-Air Q4       | `neuphonic/neutts-air-q4-gguf`          |
+//! | NeuTTS-Air Q8       | `neuphonic/neutts-air-q8-gguf`          |
+//! | NeuCodec Decoder    | `neuphonic/neucodec-onnx-decoder`       |
+//! | NeuCodec Encoder    | `neuphonic/neucodec-onnx-encoder`       |
 
 use std::path::PathBuf;
 
@@ -46,14 +51,14 @@ fn backbone_language(repo: &str) -> &'static str {
 
 /// Progress event emitted during model loading.
 ///
-/// The total step count is **4**:
+/// The total step count is **2** (backbone fetch + backbone load):
 ///
 /// | Step | Event                                         |
 /// |------|-----------------------------------------------|
-/// | 1/4  | `Fetching` backbone GGUF                      |
-/// | 2/4  | `Fetching` NeuCodec ONNX                      |
-/// | 3/4  | `Loading` backbone into llama.cpp             |
-/// | 4/4  | `Loading` codec into ONNX Runtime             |
+/// | 1/2  | `Fetching` backbone GGUF                      |
+/// | 2/2  | `Loading` backbone into llama.cpp             |
+///
+/// The Burn codec decoder is already compiled in — no download or load step.
 #[derive(Debug, Clone)]
 pub enum LoadProgress {
     /// About to fetch (or retrieve from cache) a model file.
@@ -106,27 +111,17 @@ fn hf_download_by_extension(
 /// Download and load a [`NeuTTS`] model from HuggingFace Hub, calling
 /// `on_progress` before each step for progress reporting.
 ///
+/// Downloads the GGUF backbone only (2 steps total).  The NeuCodec Burn
+/// decoder is compiled into the binary — no runtime codec download needed.
+///
 /// # Arguments
 ///
 /// * `backbone_repo` — HuggingFace repo for the GGUF backbone, e.g.
 ///   `"neuphonic/neutts-nano-q4-gguf"`.
-/// * `codec_repo`    — HuggingFace repo for the NeuCodec ONNX decoder, e.g.
-///   `"neuphonic/neucodec-onnx-decoder"`.
 /// * `on_progress`   — Progress callback; see [`LoadProgress`].
-///
-/// # Example
-///
-/// ```no_run
-/// let model = neutts::download::load_from_hub_cb(
-///     "neuphonic/neutts-nano-q4-gguf",
-///     "neuphonic/neucodec-onnx-decoder",
-///     |p| println!("{p:?}"),
-/// ).unwrap();
-/// ```
 #[cfg(feature = "backbone")]
 pub fn load_from_hub_cb<F>(
     backbone_repo: &str,
-    codec_repo: &str,
     mut on_progress: F,
 ) -> Result<NeuTTS>
 where
@@ -136,32 +131,19 @@ where
 
     // ── 1. Download GGUF backbone ─────────────────────────────────────────────
     on_progress(LoadProgress::Fetching {
-        step: 1, total: 4,
+        step: 1, total: 2,
         file: "*.gguf".into(),
         repo: backbone_repo.into(),
     });
     let backbone_path = hf_download_by_extension(&api, backbone_repo, &[".gguf"])
         .with_context(|| format!("Failed to download GGUF from '{backbone_repo}'"))?;
 
-    // ── 2. Download NeuCodec ONNX decoder ─────────────────────────────────────
-    on_progress(LoadProgress::Fetching {
-        step: 2, total: 4,
-        file: "*.onnx".into(),
-        repo: codec_repo.into(),
-    });
-    let codec_path = hf_download_by_extension(&api, codec_repo, &[".onnx"])
-        .with_context(|| format!("Failed to download ONNX from '{codec_repo}'"))?;
-
-    // ── 3 + 4. Load both models ───────────────────────────────────────────────
+    // ── 2. Load backbone (Burn codec is compiled in) ──────────────────────────
     on_progress(LoadProgress::Loading {
-        step: 3, total: 4, component: "backbone".into(),
+        step: 2, total: 2, component: "backbone".into(),
     });
     let language = backbone_language(backbone_repo).to_string();
-
-    on_progress(LoadProgress::Loading {
-        step: 4, total: 4, component: "codec".into(),
-    });
-    NeuTTS::load(&backbone_path, &codec_path, &language)
+    NeuTTS::load(&backbone_path, &language)
 }
 
 /// Download and load a [`NeuTTS`] model from HuggingFace Hub.
@@ -171,31 +153,121 @@ where
 ///
 /// **Requires the `backbone` Cargo feature.**
 #[cfg(feature = "backbone")]
-pub fn load_from_hub(backbone_repo: &str, codec_repo: &str) -> Result<NeuTTS> {
-    load_from_hub_cb(backbone_repo, codec_repo, |_| {})
+pub fn load_from_hub(backbone_repo: &str) -> Result<NeuTTS> {
+    load_from_hub_cb(backbone_repo, |_| {})
 }
 
-/// Load the default NeuTTS-Nano Q4 model with the default NeuCodec ONNX decoder.
+/// Load the default NeuTTS-Nano Q4 model.
 ///
 /// **Requires the `backbone` Cargo feature.**
 #[cfg(feature = "backbone")]
 pub fn load_default() -> Result<NeuTTS> {
-    load_from_hub(
-        "neuphonic/neutts-nano-q4-gguf",
-        "neuphonic/neucodec-onnx-decoder",
-    )
+    load_from_hub("neuphonic/neutts-nano-q4-gguf")
 }
 
-/// Download only the NeuCodec ONNX decoder (no backbone).
+/// Download the NeuCodec encoder ONNX to a specified directory.
 ///
-/// Useful on mobile where the backbone runs server-side and only the local
-/// codec is needed.
-pub fn load_codec_only(codec_repo: &str) -> Result<crate::codec::NeuCodecDecoder> {
+/// The ONNX file is only needed if you want to encode reference audio at
+/// runtime.  For the common case (using pre-encoded `.npy` reference codes),
+/// you do not need the encoder.
+///
+/// This is also the helper used by `cargo run --example download_models` to
+/// stage the ONNX for build-time Burn conversion.
+pub fn download_encoder_onnx(encoder_repo: &str, dest_dir: &std::path::Path) -> Result<PathBuf> {
     let api = Api::new().context("Failed to initialise HuggingFace Hub client")?;
-    let codec_path = hf_download_by_extension(&api, codec_repo, &[".onnx"])
-        .with_context(|| format!("Failed to download ONNX from '{codec_repo}'"))?;
-    crate::codec::NeuCodecDecoder::load(&codec_path)
-        .context("Failed to load NeuCodec ONNX decoder")
+    let path = hf_download_by_extension(&api, encoder_repo, &[".onnx"])
+        .with_context(|| format!("Failed to download encoder ONNX from '{encoder_repo}'"))?;
+
+    // Copy to dest_dir so it can be staged for build.rs conversion.
+    std::fs::create_dir_all(dest_dir)
+        .context("Failed to create model staging directory")?;
+    let dest = dest_dir.join("neucodec_encoder.onnx");
+    std::fs::copy(&path, &dest)
+        .with_context(|| format!("Failed to copy encoder ONNX to {}", dest.display()))?;
+    Ok(dest)
+}
+
+/// Download the NeuCodec decoder ONNX to a specified directory.
+///
+/// This is used by `cargo run --example download_models` to stage the ONNX
+/// for build-time Burn conversion.  You do **not** need this at runtime — the
+/// Burn decoder is compiled into the binary.
+pub fn download_decoder_onnx(decoder_repo: &str, dest_dir: &std::path::Path) -> Result<PathBuf> {
+    let api = Api::new().context("Failed to initialise HuggingFace Hub client")?;
+    let path = hf_download_by_extension(&api, decoder_repo, &[".onnx"])
+        .with_context(|| format!("Failed to download decoder ONNX from '{decoder_repo}'"))?;
+
+    std::fs::create_dir_all(dest_dir)
+        .context("Failed to create model staging directory")?;
+    let dest = dest_dir.join("neucodec_decoder.onnx");
+    std::fs::copy(&path, &dest)
+        .with_context(|| format!("Failed to copy decoder ONNX to {}", dest.display()))?;
+    Ok(dest)
+}
+
+/// Load a [`NeuCodecEncoder`](crate::codec::NeuCodecEncoder) at runtime from a
+/// local Burn record file (`.bin`) or an ONNX file that has been staged for
+/// conversion.
+///
+/// `source` is resolved as follows:
+///
+/// 1. If it ends in `.bin` and the file exists, load as a Burn record.
+/// 2. If it ends in `.onnx` and the file exists, return an error explaining
+///    that ONNX files must be converted to Burn at build time via
+///    `build.rs` / `burn-import` (not at runtime).
+/// 3. Otherwise treat it as a HuggingFace repo ID and download the ONNX
+///    to `models/`, then instruct the user to rebuild.
+///
+/// For the common case — embedding encoder weights at build time — call
+/// [`NeuCodecEncoder::new`](crate::codec::NeuCodecEncoder::new) directly.
+pub fn load_encoder(source: &str) -> Result<crate::codec::NeuCodecEncoder> {
+    let path = std::path::Path::new(source);
+
+    // Burn record file: load directly.
+    if path.extension().and_then(|e| e.to_str()) == Some("bin") && path.exists() {
+        return crate::codec::NeuCodecEncoder::load(path)
+            .with_context(|| format!("Failed to load Burn encoder from {source}"));
+    }
+
+    // ONNX file: must be converted at build time.
+    if path.extension().and_then(|e| e.to_str()) == Some("onnx") && path.exists() {
+        bail!(
+            "ONNX files cannot be loaded at runtime with the Burn backend.\n\
+             \n\
+             Stage the file for build-time conversion and rebuild:\n\
+             \n\
+             \tcp {source} models/neucodec_encoder.onnx\n\
+             \tcargo build\n"
+        );
+    }
+
+    // Try as a HuggingFace repo.
+    let models_dir = std::path::Path::new("models");
+    let staged = models_dir.join("neucodec_encoder.onnx");
+    if !staged.exists() {
+        println!("Downloading NeuCodec encoder ONNX from HuggingFace…");
+        download_encoder_onnx(source, models_dir)?;
+        bail!(
+            "Encoder ONNX downloaded to models/neucodec_encoder.onnx.\n\
+             \n\
+             Rebuild to convert it to Burn:\n\
+             \n\
+             \tcargo build\n\
+             \n\
+             Then call NeuCodecEncoder::new() — no runtime file path needed."
+        );
+    }
+
+    // The staged file exists but hasn't been compiled yet — guide the user.
+    bail!(
+        "models/neucodec_encoder.onnx is staged but the Burn model is not compiled in yet.\n\
+         \n\
+         Run:\n\
+         \n\
+         \tcargo build\n\
+         \n\
+         Then use NeuCodecEncoder::new() at runtime."
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,10 +290,12 @@ pub fn supported_backbone_repos() -> Vec<&'static str> {
     ]
 }
 
-/// Return all officially supported codec repository IDs.
-pub fn supported_codec_repos() -> Vec<&'static str> {
-    vec![
-        "neuphonic/neucodec-onnx-decoder",
-        "neuphonic/neucodec-onnx-decoder-int8",
-    ]
+/// Return the officially supported codec decoder repository ID.
+pub fn supported_codec_decoder_repo() -> &'static str {
+    "neuphonic/neucodec-onnx-decoder"
+}
+
+/// Return the officially supported codec encoder repository ID.
+pub fn supported_codec_encoder_repo() -> &'static str {
+    "neuphonic/neucodec-onnx-encoder"
 }

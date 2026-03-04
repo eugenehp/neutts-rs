@@ -9,13 +9,22 @@
 //! 3. **Speech token encode / decode** — `ids_to_token_str` ↔ `extract_ids`
 //!    round-trip.
 //! 4. **Prompt builder** — verify the GGUF prompt format.
-//! 5. **NPY write/read round-trip** — synthesize a `.npy` file, load it back.
-//! 6. **Dry-run synthesis log** — print what each pipeline step would produce
-//!    for a real voice-cloning call (without actually running the models).
+//! 5. **NPY write/read round-trip** — write a `.npy` file and load it back.
+//! 6. **Burn backend probe** — verify wgpu feature state and codec constants.
+//! 7. **Dry-run synthesis log** — trace the full pipeline without models.
 //!
 //! ## Usage
 //!
-//!   cargo run --example test_pipeline --no-default-features --features espeak
+//! ```sh
+//! # With espeak-ng (recommended)
+//! cargo run --example test_pipeline --features espeak
+//!
+//! # Force CPU-only (NdArray, no wgpu)
+//! cargo run --example test_pipeline --no-default-features --features espeak
+//!
+//! # Minimal (no espeak, no backbone, no wgpu)
+//! cargo run --example test_pipeline --no-default-features
+//! ```
 
 use std::path::Path;
 
@@ -278,13 +287,64 @@ fn test_npy() {
     let _ = std::fs::remove_file(&f_path);
 }
 
-// ─── 6. Dry-run synthesis log ────────────────────────────────────────────────
+// ─── 6. Burn backend probe ───────────────────────────────────────────────────
+
+fn test_burn_backend() {
+    section("6 · Burn Backend");
+
+    // Feature-flag report
+    let wgpu_feature = neutts::codec::wgpu_feature_enabled();
+    item(
+        "wgpu Cargo feature",
+        if wgpu_feature { "\x1b[32menabled\x1b[0m (GPU tried first, NdArray fallback)" }
+        else            { "\x1b[2mdisabled\x1b[0m (NdArray CPU always used)" },
+    );
+
+    // Codec constants
+    item("decoder sample rate", &format!("{} Hz", neutts::codec::SAMPLE_RATE));
+    item("encoder sample rate", &format!("{} Hz", neutts::codec::ENCODER_SAMPLE_RATE));
+    item("samples / token (decoder)", &format!("{}", neutts::codec::SAMPLES_PER_TOKEN));
+    item("samples / token (encoder)", &format!("{}", neutts::codec::ENCODER_SAMPLES_PER_TOKEN));
+    item("encoder default input",
+        &format!("{} samples = {} s @ {} Hz",
+            neutts::codec::ENCODER_DEFAULT_INPUT_SAMPLES,
+            neutts::codec::ENCODER_DEFAULT_INPUT_SAMPLES / neutts::codec::ENCODER_SAMPLE_RATE as usize,
+            neutts::codec::ENCODER_SAMPLE_RATE));
+
+    // Runtime decoder probe (only succeeds if ONNX was converted at build time)
+    match neutts::NeuCodecDecoder::new() {
+        Ok(dec) => {
+            ok(&format!("NeuCodecDecoder::new() → backend: \x1b[1m{}\x1b[0m", dec.backend_name()));
+        }
+        Err(_) => {
+            println!(
+                "  \x1b[2m~  NeuCodecDecoder::new() → not compiled in \
+                 (run `download_models` + `cargo build` to embed weights)\x1b[0m"
+            );
+        }
+    }
+
+    // Runtime encoder probe
+    match neutts::NeuCodecEncoder::new() {
+        Ok(enc) => {
+            ok(&format!("NeuCodecEncoder::new() → backend: \x1b[1m{}\x1b[0m", enc.backend_name()));
+        }
+        Err(_) => {
+            println!(
+                "  \x1b[2m~  NeuCodecEncoder::new() → not compiled in \
+                 (run `download_models` + `cargo build` to embed weights)\x1b[0m"
+            );
+        }
+    }
+}
+
+// ─── 7. Dry-run synthesis log ────────────────────────────────────────────────
 
 fn test_dry_run() {
-    section("6 · Dry-run Synthesis Log");
+    section("7 · Dry-run Synthesis Log");
     println!("  (simulates the full pipeline without running any model)\n");
 
-    // ── Step 1: preprocess text ────────────────────────────────────────────
+    // ── Step 1: preprocess text ───────────────────────────────────────────
     let input_text = "Hello! I don't know if you've heard, but NeuTTS costs $0.00 to run locally.";
     let ref_text   = "So I just tried Neuphonic and I'm genuinely impressed.";
     let pp = TextPreprocessor::new();
@@ -334,10 +394,21 @@ fn test_dry_run() {
     item("step 6 extracted ids count", &format!("{} (matches)", extracted.len()));
 
     // ── Step 7: what the codec would decode ────────────────────────────────
-    let expected_audio_samples = extracted.len() * 480; // 24000 / 50 = 480 samples per token
-    let expected_duration_s    = expected_audio_samples as f32 / 24_000.0;
-    item("step 7 expected audio samples", &format!("{expected_audio_samples} ≈ {expected_duration_s:.2} s @ 24 kHz"));
-    item("step 7 status", "(codec.decode() would run here if model is loaded)");
+    let expected_audio_samples = extracted.len() * neutts::codec::SAMPLES_PER_TOKEN;
+    let expected_duration_s    = expected_audio_samples as f32 / neutts::codec::SAMPLE_RATE as f32;
+    item(
+        "step 7 expected audio",
+        &format!(
+            "{expected_audio_samples} samples ≈ {expected_duration_s:.2} s @ {} Hz",
+            neutts::codec::SAMPLE_RATE
+        ),
+    );
+    let backend_hint = if neutts::codec::wgpu_feature_enabled() {
+        "wgpu (GPU) or ndarray (CPU) fallback"
+    } else {
+        "ndarray (CPU)"
+    };
+    item("step 7 backend", &format!("codec.decode() would run on {backend_hint}"));
 
     ok("dry-run complete — all stages exercised without model files");
 }
@@ -399,11 +470,19 @@ fn main() {
     #[cfg(not(feature = "backbone"))]
     println!("  backbone:  \x1b[2mnot compiled (rebuild with default features)\x1b[0m");
 
+    // Burn backend status
+    if neutts::codec::wgpu_feature_enabled() {
+        println!("  burn:      \x1b[32mwgpu enabled\x1b[0m (GPU → NdArray fallback at runtime)");
+    } else {
+        println!("  burn:      \x1b[2mwgpu disabled\x1b[0m — NdArray CPU only");
+    }
+
     test_preprocessing();
     test_phonemization();
     test_tokens();
     test_prompt();
     test_npy();
+    test_burn_backend();
     test_dry_run();
 
     println!("\n\x1b[1;32m━━━  All tests completed  ━━━\x1b[0m\n");

@@ -3,50 +3,43 @@ name = "neutts"
 version = "0.1.0"
 edition = "2021"
 authors = ["NeuTTS-RS Contributors"]
-description = "Rust port of NeuTTS — on-device voice-cloning TTS with GGUF backbone and NeuCodec ONNX decoder"
+description = "Rust port of NeuTTS — on-device voice-cloning TTS with GGUF backbone and NeuCodec decoder"
 repository = "https://github.com/neuphonic/neutts-rs"
 homepage = "https://github.com/neuphonic/neutts-rs"
 keywords = ["tts", "text-to-speech", "voice-cloning", "gguf", "speech-synthesis"]
-license = "Apache-2.0"
+license = "MIT"
 
 exclude = ["ios", "android"]
 
 # ── Feature flags ────────────────────────────────────────────────────────────
 #
-# [default] — backbone is on by default.  The crate compiles with the GGUF
-#   backbone (llama-cpp-2) and the NeuCodec ONNX decoder (ort).
-#   Without `espeak`, only pre-phonemized IPA strings are accepted by the
-#   generate API; raw-text input requires enabling the `espeak` feature.
+# backbone — links llama-cpp-2 (builds llama.cpp via cmake + C++ compiler).
+#            Enables load_backbone(), generate_*().
 #
-# backbone — links llama-cpp-2 which builds llama.cpp from source via cmake.
-#   Requires cmake + a C++ compiler.  Enables: load_backbone(), generate_*().
-#   Disable to build a codec-only binary (useful for token-stream decoding).
+# espeak   — links libespeak-ng; enables raw-text input (text → IPA → model).
 #
-# espeak — links libespeak-ng and enables raw-text input (text → IPA → model).
-#   See build.rs for platform install instructions.
-#   Without it, pass pre-phonemized IPA via generate_from_ipa().
+# wgpu     — reserved for future GPU acceleration (currently a no-op).
+#            NeuCodec inference runs on CPU (ndarray) by default.
 #
-# metal / cuda — GPU acceleration for the backbone (macOS Metal / NVIDIA CUDA).
-#   Passed through to llama-cpp-2.
+# metal / cuda — GPU acceleration for the backbone only (passed to llama-cpp-2).
 [features]
-default = ["backbone"]
+default  = ["backbone"]
 backbone = ["dep:llama-cpp-2"]
-espeak = []
-metal = ["llama-cpp-2?/metal"]
-cuda  = ["llama-cpp-2?/cuda"]
+espeak   = []
+wgpu     = []          # reserved — no-op until Burn/wgpu codec is wired up
+metal    = ["llama-cpp-2?/metal"]
+cuda     = ["llama-cpp-2?/cuda"]
 
 [lib]
-# rlib     — used by `cargo test`, `cargo build`, and downstream Rust crates.
-# staticlib — produces libneutts.a for iOS / Android builds.
 crate-type = ["staticlib", "rlib"]
 
 # ── Platform-independent dependencies ────────────────────────────────────────
 
 [dependencies]
-# WAV file I/O
+# WAV I/O
 hound = "3"
 
-# Regex for text preprocessing, tokenisation, and speech-token extraction
+# Regex for text preprocessing, tokenisation, speech-token extraction
 fancy-regex = "0.14"
 regex = "1"
 once_cell = "1"
@@ -62,51 +55,36 @@ thiserror = "1"
 # Random seed for sampling
 rand = "0.8"
 
-# ZIP for NPZ parsing (reference code .npy loading)
+# NPY / NPZ parsing
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-# GGUF backbone (llama.cpp Rust bindings) — optional, desktop only
+# SHA-256 for reference-code cache keying
+sha2 = "0.10"
+
+# Platform cache dirs
+dirs = "6"
+
+# ── NeuCodec decoder (pure-Rust CPU inference) ────────────────────────────────
+#
+# Weights are loaded at runtime from `models/neucodec_decoder.safetensors`
+# (convert once with `python scripts/convert_weights.py`).
+#
+# safetensors — loads the weight file (HuggingFace format)
+# rustfft     — ISTFT for the Vocos decoder head
+# ndarray     — tensor operations (matmul, conv1d, norms)
+safetensors = "0.5"
+rustfft = "6"
+ndarray = "0.16"
+
+# GGUF backbone — optional
 [dependencies.llama-cpp-2]
 version = "0.1"
 optional = true
 
-# ── Desktop dependencies (Linux / macOS / Windows) ───────────────────────────
+# ── Desktop-only dependencies ─────────────────────────────────────────────────
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-# HuggingFace Hub for downloading backbone GGUF + codec ONNX files.
 hf-hub = "0.5"
-
-# ONNX Runtime — NeuCodec ONNX decoder.
-ort = { version = "=2.0.0-rc.11", default-features = false, features = [
-    "std",
-    "pkg-config",        # try system libonnxruntime first
-    "download-binaries", # fallback: fetch pre-built binary
-    "tls-native",        # TLS for ORT downloads
-    "copy-dylibs",       # copy .so/.dylib next to the output binary
-] }
-
-# ── iOS dependencies ──────────────────────────────────────────────────────────
-
-[target.'cfg(target_os = "ios")'.dependencies]
-ort = { version = "=2.0.0-rc.11", default-features = false, features = [
-    "std",
-    "download-binaries",
-    "tls-rustls",
-] }
-
-# ── Android dependencies ──────────────────────────────────────────────────────
-
-[target.'cfg(target_os = "android")'.dependencies]
-ort = { version = "=2.0.0-rc.11", default-features = false, features = [
-    "std",
-    "download-binaries",
-    "tls-rustls",
-    "copy-dylibs",
-] }
-
-# ── Build dependencies ────────────────────────────────────────────────────────
-
-# No external crates needed — build.rs uses std::process::Command.
 
 # ── Examples ──────────────────────────────────────────────────────────────────
 
@@ -118,3 +96,16 @@ required-features = ["backbone", "espeak"]
 [[example]]
 name = "test_pipeline"
 path = "examples/test_pipeline.rs"
+
+[[example]]
+name = "encode_reference"
+path = "examples/encode_reference.rs"
+
+[[example]]
+name = "clone_voice"
+path = "examples/clone_voice.rs"
+required-features = ["backbone", "espeak"]
+
+[[example]]
+name = "download_models"
+path = "examples/download_models.rs"

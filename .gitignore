@@ -1,3 +1,8 @@
 .DS_Store
 /target/
 /espeak-static/
+
+# NeuCodec weight files — large, generated locally
+/models/*.onnx
+/models/*.bin
+/models/*.safetensors
