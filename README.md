@@ -199,7 +199,7 @@ cargo run --example speak -- --list-models
 | `neuphonic/neutts-nano-french` | NeuTTS Nano French (full) | fr-fr | 0.2B | |
 | `neuphonic/neutts-nano-spanish-q4-gguf` | NeuTTS Nano Spanish Q4 | es | 0.2B | ✅ |
 | `neuphonic/neutts-nano-spanish-q8-gguf` | NeuTTS Nano Spanish Q8 | es | 0.2B | ✅ |
-| `neuphonic/neutts-nano-spanish` | NeuTTS Nano Spanish (full) | es | 0.2B | ✅ |
+| `neuphonic/neutts-nano-spanish` | NeuTTS Nano Spanish (full) | es | 0.2B |  |
 
 To discover which specific GGUF quantisation variants are in a repo:
 
