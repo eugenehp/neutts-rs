@@ -90,6 +90,15 @@ impl BackboneModel {
             .str_to_token(prompt, AddBos::Always)
             .context("Tokenisation failed")?;
 
+        eprintln!("[backbone] prompt token count: {} / n_ctx={}", tokens.len(), self.n_ctx);
+        if tokens.len() as u32 > self.n_ctx {
+            anyhow::bail!(
+                "Prompt too long: {} tokens exceeds n_ctx={}. \
+                 Reduce reference code count.",
+                tokens.len(), self.n_ctx
+            );
+        }
+
         if tokens.is_empty() {
             return Ok(String::new());
         }
@@ -204,6 +213,15 @@ impl BackboneModel {
         let tokens = self.model
             .str_to_token(prompt, AddBos::Always)
             .context("Tokenisation failed")?;
+
+        eprintln!("[backbone] prompt token count: {} / n_ctx={}", tokens.len(), self.n_ctx);
+        if tokens.len() as u32 > self.n_ctx {
+            anyhow::bail!(
+                "Prompt too long: {} tokens exceeds n_ctx={}. \
+                 Reduce reference code count.",
+                tokens.len(), self.n_ctx
+            );
+        }
 
         if tokens.is_empty() {
             return Ok(());

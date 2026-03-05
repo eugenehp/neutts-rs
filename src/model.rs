@@ -277,6 +277,60 @@ impl NeuTTS {
         Ok(())
     }
 
+    /// Encode `audio` samples into an in-memory WAV buffer (16-bit PCM, 24 kHz,
+    /// mono) and return the raw bytes.
+    ///
+    /// Same peak-normalisation as [`write_wav`] but writes directly into a
+    /// `Vec<u8>` without touching the filesystem.  All chunk sizes are known
+    /// before writing begins, so the canonical 44-byte header is constructed
+    /// in a single forward pass — no seeking required.
+    ///
+    /// Useful for in-process audio playback via decoders that accept a byte
+    /// cursor (e.g. `rodio::Decoder::new(std::io::Cursor::new(bytes))`).
+    ///
+    /// [`write_wav`]: Self::write_wav
+    pub fn to_wav_bytes(&self, audio: &[f32]) -> Vec<u8> {
+        // Peak normalisation: scale down only if necessary, never amplify.
+        let peak  = audio.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+        let scale = if peak > 1.0 { 1.0 / peak } else { 1.0 };
+
+        let num_channels:   u16 = 1;
+        let bits_per_sample: u16 = 16;
+        let sample_rate:    u32 = SAMPLE_RATE;
+        let byte_rate:      u32 = sample_rate * num_channels as u32 * bits_per_sample as u32 / 8;
+        let block_align:    u16 = num_channels * bits_per_sample / 8;
+        let data_size:      u32 = (audio.len() * 2) as u32; // 2 bytes per 16-bit sample
+
+        // 44-byte canonical WAV header + PCM data.
+        let mut buf = Vec::with_capacity(44 + audio.len() * 2);
+
+        // ── RIFF chunk ────────────────────────────────────────────────────────
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&(36 + data_size).to_le_bytes());   // file size − 8
+        buf.extend_from_slice(b"WAVE");
+
+        // ── fmt sub-chunk ─────────────────────────────────────────────────────
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());              // chunk size (PCM = 16)
+        buf.extend_from_slice(&1u16.to_le_bytes());               // audio format: PCM
+        buf.extend_from_slice(&num_channels.to_le_bytes());
+        buf.extend_from_slice(&sample_rate.to_le_bytes());
+        buf.extend_from_slice(&byte_rate.to_le_bytes());
+        buf.extend_from_slice(&block_align.to_le_bytes());
+        buf.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+        // ── data sub-chunk ────────────────────────────────────────────────────
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_size.to_le_bytes());
+        for &s in audio {
+            let s16 = (s * scale * i16::MAX as f32)
+                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            buf.extend_from_slice(&s16.to_le_bytes());
+        }
+
+        buf
+    }
+
     // ── High-level convenience wrappers ───────────────────────────────────────
 
     /// Generate audio and save to a WAV file in one call.
