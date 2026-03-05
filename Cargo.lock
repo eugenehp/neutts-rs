@@ -3064,6 +3064,7 @@ dependencies = [
  "hf-hub",
  "hound",
  "llama-cpp-2",
+ "memmap2",
  "ndarray 0.16.1",
  "once_cell",
  "rand 0.8.5",

@@ -78,6 +78,7 @@ dirs = "6"
 safetensors = "0.5"
 rustfft = "6"
 ndarray = "0.16"
+memmap2 = "0.9"
 
 # ── Burn — GPU/CPU codec acceleration (optional, enabled by `wgpu` feature) ──
 #

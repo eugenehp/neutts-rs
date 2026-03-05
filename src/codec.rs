@@ -69,10 +69,36 @@ fn load_f32(st: &SafeTensors<'_>, name: &str) -> Result<Vec<f32>> {
     let raw = view.data();
     use safetensors::tensor::Dtype;
     Ok(match view.dtype() {
-        Dtype::F32 => raw
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
+        Dtype::F32 => {
+            // Fast path: the bytes are already little-endian f32.  On LE
+            // hosts (x86, ARM) we can reinterpret directly with no per-byte
+            // work — essentially a single memcpy via the Vec allocation.
+            assert!(raw.len() % 4 == 0, "F32 tensor byte length not divisible by 4");
+            let n = raw.len() / 4;
+            let mut out = Vec::with_capacity(n);
+            // SAFETY: raw is valid, aligned to u8 (no alignment requirement
+            // for the source), and we write exactly `n` f32 values.
+            #[cfg(target_endian = "little")]
+            {
+                // SAFETY: f32 and u8 have no padding/invalid-bit patterns for
+                // this cast; we own `out` and set its length immediately after.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        raw.as_ptr(),
+                        out.as_mut_ptr() as *mut u8,
+                        raw.len(),
+                    );
+                    out.set_len(n);
+                }
+            }
+            #[cfg(not(target_endian = "little"))]
+            {
+                out.extend(raw.chunks_exact(4).map(|b| {
+                    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                }));
+            }
+            out
+        }
         Dtype::BF16 => raw
             .chunks_exact(2)
             .map(|b| {
@@ -920,19 +946,35 @@ impl NeuCodecDecoder {
             );
         }
 
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
+        // Memory-map the file so the OS pages in tensor data on demand instead
+        // of reading all 840 MB into a heap Vec<u8> upfront.  This halves peak
+        // RAM usage during loading and avoids a large malloc + full-file copy.
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("Failed to open {}", path.display()))?;
+        // SAFETY: we do not mutate the mapping, and we hold `mmap` for the
+        // full lifetime of `st` (both are dropped at the end of this block
+        // after `load_decoder_weights` has copied all tensors into ndarray).
+        let mmap = unsafe {
+            memmap2::Mmap::map(&file)
+                .with_context(|| format!("Failed to mmap {}", path.display()))?
+        };
+        let bytes: &[u8] = &mmap;
 
         // Read user-defined metadata (n_heads, depth, etc.) from the file header
-        let (_, file_meta) = SafeTensors::read_metadata(&bytes)
+        let (_, file_meta) = SafeTensors::read_metadata(bytes)
             .with_context(|| format!("Failed to parse safetensors header: {}", path.display()))?;
         let user_meta = file_meta.metadata().clone();
 
-        let st = SafeTensors::deserialize(&bytes)
+        let st = SafeTensors::deserialize(bytes)
             .with_context(|| format!("Failed to parse safetensors: {}", path.display()))?;
 
         let weights = load_decoder_weights(&st, &user_meta)
             .with_context(|| format!("Failed to load decoder weights from {}", path.display()))?;
+
+        // `st` and `mmap` are dropped here — all tensor data is now owned by
+        // the ndarray arrays inside `weights`.
+        drop(st);
+        drop(mmap);
 
         println!(
             "NeuCodec decoder: hidden={}, depth={}, heads={}, hop={} ({} samples/token = {} tokens/s)",

@@ -225,6 +225,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Load models ───────────────────────────────────────────────────────────
     println!("Loading models…");
+    let t_load = Instant::now();
     let tts = neutts::download::load_from_hub_cb(&backbone, gguf_file.as_deref(), |p| {
         use neutts::download::LoadProgress;
         match &p {
@@ -245,7 +246,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
     })?;
-    println!("  → codec : {}", tts.codec.backend_name());
+    println!("  → codec   : {}", tts.codec.backend_name());
+    println!("  → loaded in {:.2} s", t_load.elapsed().as_secs_f32());
     println!();
 
     // ── Get reference codes ───────────────────────────────────────────────────
@@ -254,10 +256,13 @@ fn main() -> anyhow::Result<()> {
         (_, Some(ref npy)) => {
             anyhow::ensure!(npy.exists(), "Codes file not found: {}", npy.display());
             println!("Loading codes from {}…", npy.display());
+            let t_npy = Instant::now();
             let codes = tts.load_ref_codes(npy)?;
             println!(
-                "  → {} tokens  ({:.1} s of reference audio)",
-                codes.len(), codes.len() as f32 / 50.0
+                "  → {} tokens  ({:.1} s of reference audio, loaded in {:.0} ms)",
+                codes.len(),
+                codes.len() as f32 / 50.0,
+                t_npy.elapsed().as_secs_f64() * 1000.0,
             );
             println!();
             codes
@@ -273,10 +278,13 @@ fn main() -> anyhow::Result<()> {
             if cache_npy.exists() {
                 // ── Cache hit ─────────────────────────────────────────────────
                 println!("Loading cached codes from {}…", cache_npy.display());
+                let t_npy = Instant::now();
                 let codes = tts.load_ref_codes(&cache_npy)?;
                 println!(
-                    "  → {} tokens  ({:.1} s)  [cached, skipping encode]",
-                    codes.len(), codes.len() as f32 / 50.0
+                    "  → {} tokens  ({:.1} s)  [cached, loaded in {:.0} ms]",
+                    codes.len(),
+                    codes.len() as f32 / 50.0,
+                    t_npy.elapsed().as_secs_f64() * 1000.0,
                 );
                 println!();
                 codes
