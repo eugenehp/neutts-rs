@@ -151,6 +151,102 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Planned
 - Pure-Rust NeuCodec encoder (removes Python dependency for reference encoding).
-- `wgpu` feature for GPU-accelerated codec inference.
-- Streaming / chunked synthesis API.
 - iOS / Android build guides and pre-built XCFramework.
+
+---
+
+## [0.0.2] — 2026-03-05
+
+### Added
+
+#### Streaming backbone API (`src/backbone.rs`)
+- `BackboneModel::generate_streaming<F: FnMut(&str) -> Result<()>>(prompt,
+  max_new_tokens, on_piece)` — calls `on_piece` with each decoded text piece
+  immediately as it is produced, rather than accumulating the full output.
+  Enables audio to begin playing before the backbone finishes generating.
+  Errors returned from the callback propagate out of `generate_streaming`
+  unchanged, allowing clean abort from within the closure.
+  The stop token (`<|SPEECH_GENERATION_END|>`) is never forwarded; any text
+  preceding it within the same piece is correctly emitted first.
+
+#### `stream_pcm` example (`examples/stream_pcm.rs`)
+- New example demonstrating the preload-once, stream-forever pattern:
+  1. Models (backbone + codec) are loaded once at startup; all subsequent
+     synthesis calls pay no loading cost.
+  2. Backbone runs in streaming mode via `generate_streaming`.
+  3. Speech tokens accumulate in a pending buffer; once the buffer reaches
+     `--chunk` tokens the codec decodes the chunk and writes raw signed
+     16-bit little-endian PCM to stdout.
+  4. Timing diagnostics (time-to-first-audio, RTF) are printed to stderr
+     so they do not corrupt the byte stream.
+- `--chunk N` flag (default: 25 tokens = 500 ms): controls the
+  latency/quality trade-off at chunk boundaries.
+- Pipe to `aplay` (Linux), `sox -d` (macOS), or `ffplay` for real-time
+  playback; redirect to a `.pcm` file and convert with `sox`/`ffmpeg`.
+
+#### RoPE computation feature flags (`Cargo.toml`, `src/codec.rs`, `build.rs`)
+- `fast` feature (default): RoPE sin/cos computed via a degree-7/6 Horner-form
+  polynomial with f32 range reduction.  No transcendental function calls; 6 FMAs
+  per sin and per cos value.  Max absolute error ≈ 1 × 10⁻⁴ — imperceptible in
+  speech synthesis.
+- `precise` feature: RoPE sin/cos delegates to `f32::sin_cos()`, which is
+  correctly rounded (ULP ≤ 1) on x86 SSE/AVX, ARM NEON, and Apple Silicon.
+- `pub(crate) fn rope_sin_cos(x: f32) -> (f32, f32)` — single dispatch point
+  in `codec.rs` shared by the CPU decoder (`apply_rope`) and the GPU decoder
+  precompute pass (`load_weights`), ensuring both paths always use the same
+  algorithm.
+- Build-time conflict check in `build.rs`: setting both `fast` and `precise`
+  simultaneously is a hard compile-time error with a clear message.
+
+### Changed
+
+#### `NeuCodecDecoder` — eager GPU backend initialisation (`src/codec.rs`)
+- **Before**: the Burn wgpu/NdArray backend was initialised lazily on the
+  first call to `decode()`, meaning the ~1.7 s GPU upload was silently
+  counted inside synthesis time ("synth took X s").
+- **After**: `NeuCodecDecoder::from_file()` initialises the backend
+  immediately after loading weights.  GPU upload time now appears in "loaded
+  in X s" and no longer inflates the synthesis RTF.
+  Measured on M2 (Metal, neutts-nano-Q4_0): synthesis RTF improved from
+  **1.79×** to **~1.1×** real-time.
+
+#### Pre-computed RoPE tables (`src/codec_burn.rs`)
+- `BurnWeights` gains `rope_cos: Tensor<B, 2>` and `rope_sin: Tensor<B, 2>`
+  fields (shape `[2048, head_dim/2]`), computed once in `load_weights()` and
+  stored as device tensors.
+- `t_apply_rope` now accepts pre-sliced `&Tensor<B, 2>` cos/sin rather than
+  recomputing and re-uploading them from CPU on every call.
+- `t_transformer_block` forwards the pre-sliced tables to both the Q and K
+  `t_apply_rope` calls.
+- `burn_decode` slices the tables to the current sequence length once (a
+  single O(1) view op) and passes the slices into the transformer fold.
+- **Net result**: 24 CPU→GPU uploads eliminated per decode call
+  (12 transformer blocks × Q and K projections), reducing GPU command-buffer
+  pressure and host-to-device synchronisation stalls.
+- The single-pass `theta.iter().map(rope_sin_cos).unzip()` replaces the two
+  separate `.map(|v| v.cos()).collect()` / `.map(|v| v.sin()).collect()`
+  passes, halving the number of iterations over the theta table.
+
+#### `BurnWeights` struct (`src/codec_burn.rs`)
+- Added fields: `rope_cos`, `rope_sin`, `head_dim`.
+- The `head_dim` field (`hidden / n_heads`) is derived from `DecoderWeights`
+  at load time and stored to avoid repeated division inside `burn_decode`.
+
+#### `burn_decode` (`src/codec_burn.rs`)
+- `t` (sequence length) is now computed once at the top of the function from
+  `codes.len()` and reused throughout, avoiding the shadowed `let [t, n_out]`
+  destructure at step 9.
+- Local variable `half` at step 10 renamed to `n_bins` for clarity (it
+  represents the number of STFT frequency bins, not `head_dim/2`).
+
+### Removed
+
+#### `LazyBurnDecoder::Pending` variant (`src/codec.rs`)
+- The `Pending` variant was never constructed after the eager-init refactor.
+  Removed to eliminate the dead-code warning.  `backend_name()` and
+  `decode()` updated to match the now-exhaustive enum.
+
+### Fixed
+
+- `backend_name()` no longer returns the misleading string
+  `"burn/wgpu (pending — lazy init)"` in any reachable code path.

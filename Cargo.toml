@@ -1,6 +1,6 @@
 [package]
 name = "neutts"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 authors = ["Eugene Hauptmann"]
 description = "Rust port of NeuTTS — on-device voice-cloning TTS with GGUF backbone and NeuCodec decoder"
@@ -160,3 +160,8 @@ path = "examples/convert_weights.rs"
 [[example]]
 name = "debug_decode"
 path = "examples/debug_decode.rs"
+
+[[example]]
+name = "stream_pcm"
+path = "examples/stream_pcm.rs"
+required-features = ["backbone", "espeak"]

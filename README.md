@@ -5,7 +5,8 @@ built on a GGUF LLM backbone and the [NeuCodec](https://huggingface.co/neuphonic
 neural audio codec.
 
 **Pure Rust — no ONNX Runtime, no native ML dependencies.**  
-The codec runs as a self-contained CPU inference engine (`safetensors` + `ndarray` + `rustfft`).
+The codec runs as a self-contained CPU/GPU inference engine
+(`safetensors` + `ndarray` + `rustfft`, with optional `burn`/`wgpu` GPU path).
 
 ---
 
@@ -67,7 +68,8 @@ pip install neucodec huggingface_hub torchaudio
 
 | Example | What it does |
 |---------|-------------|
-| `speak` | **Recommended.** WAV in → synthesised audio out. Encodes on first run, caches `.npy` beside the WAV. Supports `--list-models`, `--list-files`, `--gguf-file`. |
+| [`speak`](#speak) | **Recommended.** WAV in → WAV out. Encodes on first run, caches `.npy`. Supports `--list-models`, `--list-files`, `--gguf-file`. |
+| [`stream_pcm`](#stream_pcm) | **Streaming.** Preloads models once, streams raw PCM to stdout as audio is synthesised in chunks. |
 | `basic` | Synthesise from a pre-encoded `.npy` reference |
 | `clone_voice` | Full voice cloning — `.npy` or raw WAV + SHA-256 cache |
 | `encode_reference` | Stub — returns a helpful error; use Python for now |
@@ -136,42 +138,61 @@ cargo run --example speak --no-default-features --features espeak -- \
 | `--list-files` | | Print all `.gguf` files in `--backbone` and exit |
 | `--list-models` | | Print table of all known backbone repos and exit |
 
-### basic
+### stream_pcm
+
+Preloads the backbone and codec **once at startup**, then drives the backbone in
+streaming mode: speech tokens are forwarded to the codec in chunks as they are
+generated, and raw signed 16-bit little-endian PCM is written to stdout as each
+chunk is ready.  Timing diagnostics (time-to-first-audio, RTF) go to stderr so
+they do not corrupt the byte stream.
 
 ```sh
-# Default: NeuTTS-Nano Q4, bundled Jo voice
-cargo run --example basic --features espeak
+# Linux — aplay
+cargo run --example stream_pcm --features espeak -- \
+  --codes samples/dave.npy --ref-text samples/dave.txt \
+  --text "Hello, streaming audio." | \
+  aplay -f S16_LE -r 24000 -c 1
 
-# Custom text and reference
-cargo run --example basic --features espeak -- \
-  --text      "The quick brown fox." \
-  --ref-codes samples/jo.npy \
-  --ref-text  samples/jo.txt
+# macOS — sox
+cargo run --example stream_pcm --features espeak -- \
+  --codes samples/dave.npy --ref-text samples/dave.txt \
+  --text "Hello, streaming audio." | \
+  sox -t raw -r 24000 -e signed -b 16 -c 1 - -d
 
-# Different backbone
-cargo run --example basic --features espeak -- \
-  --backbone neuphonic/neutts-air-q4-gguf
+# Cross-platform — ffplay
+cargo run --example stream_pcm --features espeak -- \
+  --codes samples/dave.npy --ref-text samples/dave.txt \
+  --text "Hello, streaming audio." | \
+  ffplay -f s16le -ar 24000 -ac 1 -nodisp -
+
+# Save to file, then convert
+cargo run --example stream_pcm --features espeak -- \
+  --codes samples/dave.npy --ref-text samples/dave.txt \
+  --text "Hello." > output.pcm
+sox -t raw -r 24000 -e signed -b 16 -c 1 output.pcm output.wav
 ```
 
-### clone_voice
+**stream_pcm flags:**
 
-```sh
-# First run: encodes + SHA-256 caches
-cargo run --example clone_voice --features espeak -- \
-  --ref-audio samples/jo.wav \
-  --text      "Hello."
+| Flag | Short | Default | Purpose |
+|------|-------|---------|---------|
+| `--codes PATH` | `-c` | *(required)* | Pre-encoded `.npy` reference codes |
+| `--text TEXT` | `-t` | *(required)* | Text to synthesise |
+| `--ref-text TEXT\|PATH` | `-r` | auto | Transcript of the reference recording |
+| `--backbone REPO` | `-b` | nano-q4 | HuggingFace backbone repo |
+| `--gguf-file FILE` | `-g` | auto | Specific `.gguf` filename |
+| `--chunk N` | `-k` | `25` | Tokens per decode chunk (25 ≈ 500 ms) |
 
-# Second run: cache hit, encoder skipped
-cargo run --example clone_voice --features espeak -- \
-  --ref-audio samples/jo.wav \
-  --text      "Different text."
+**Chunk size trade-off:**
 
-# Pre-encoded .npy
-cargo run --example clone_voice --features espeak -- \
-  --ref-codes samples/jo.npy \
-  --ref-text  samples/jo.txt \
-  --text      "Hello."
-```
+| `--chunk` | Audio buffered | Latency (TTFA) | Quality at boundaries |
+|-----------|---------------|----------------|-----------------------|
+| 10 | ~200 ms | lowest | mild artefacts possible |
+| 25 | ~500 ms | balanced | good *(default)* |
+| 50 | ~1 s | higher | best |
+
+Each chunk is decoded independently by the NeuCodec transformer, so very small
+chunks lose cross-chunk attention context.  Values ≥ 25 are recommended.
 
 ---
 
@@ -199,7 +220,7 @@ cargo run --example speak -- --list-models
 | `neuphonic/neutts-nano-french` | NeuTTS Nano French (full) | fr-fr | 0.2B | |
 | `neuphonic/neutts-nano-spanish-q4-gguf` | NeuTTS Nano Spanish Q4 | es | 0.2B | ✅ |
 | `neuphonic/neutts-nano-spanish-q8-gguf` | NeuTTS Nano Spanish Q8 | es | 0.2B | ✅ |
-| `neuphonic/neutts-nano-spanish` | NeuTTS Nano Spanish (full) | es | 0.2B |  |
+| `neuphonic/neutts-nano-spanish` | NeuTTS Nano Spanish (full) | es | 0.2B | |
 
 To discover which specific GGUF quantisation variants are in a repo:
 
@@ -224,9 +245,12 @@ cargo run --example speak --features espeak -- \
 ```
 text ──► espeak-ng ──► IPA ──┐
                               ├──► prompt builder ──► GGUF backbone ──► speech tokens
-ref_codes (.npy) ─────────────┘                                               │
+ref_codes (.npy) ─────────────┘                          (llama-cpp-2)        │
                                                                                ▼
                                                                    NeuCodec decoder
+                                                              (Burn wgpu GPU  ──or──
+                                                               Burn NdArray CPU ──or──
+                                                               raw ndarray CPU)
                                                                                │
                                                                                ▼
                                                                    audio (Vec<f32>, 24 kHz)
@@ -235,11 +259,15 @@ ref_codes (.npy) ─────────────┘                     
 ### GGUF backbone
 
 Small causal LM in GGUF format, run via `llama-cpp-2`.  Takes a phonemized text
-prompt and pre-encoded reference speaker codes, generates `<|speech_N|>` tokens.
+prompt and pre-encoded reference speaker codes, generates `<|speech_N|>` tokens
+one at a time.  The `generate_streaming` API forwards each token to a callback
+immediately, enabling low-latency audio delivery.
 
 ### NeuCodec decoder (pure Rust)
 
-XCodec2-based architecture loaded at runtime from `models/neucodec_decoder.safetensors`:
+XCodec2-based architecture loaded at runtime from `models/neucodec_decoder.safetensors`.
+With the `wgpu` feature the full forward pass runs on the GPU (Metal / Vulkan / DX12);
+the final ISTFT always runs on CPU.
 
 ```
 codes [T]
@@ -251,11 +279,12 @@ codes [T]
     ├─ Conv1d(k=7)
     ├─ 2 × ResnetBlock  (GroupNorm → SiLU → Conv1d)
     ├─ 12 × TransformerBlock  (RMSNorm → MHA + RoPE → SiLU MLP)
+    │        └─ RoPE tables pre-computed at load time (see `fast`/`precise` features)
     └─ 2 × ResnetBlock + LayerNorm
          │
    ISTFTHead
     ├─ Linear(1024 → n_fft+2)
-    └─ ISTFT (same padding, Hann window)
+    └─ ISTFT (same padding, Hann window, always CPU)
          │
    audio [T × hop_length]  (24 kHz)
 ```
@@ -292,13 +321,50 @@ Each has a `.wav` (original audio), `.npy` (pre-encoded tokens), and `.txt` (tra
 |---------|---------|-------------|
 | `backbone` | ✓ | GGUF backbone via `llama-cpp-2` (requires cmake + C++) |
 | `espeak` | | Raw-text input via `libespeak-ng` |
-| `wgpu` | | Reserved for future GPU codec acceleration (currently no-op) |
+| `wgpu` | | GPU-accelerated codec via Burn wgpu (Metal/Vulkan/DX12); auto-falls back to Burn NdArray CPU, then raw ndarray |
 | `metal` | | macOS Metal GPU for the backbone |
 | `cuda` | | NVIDIA CUDA for the backbone |
+| `fast` | ✓ | RoPE: degree-7/6 Horner polynomial (~1 × 10⁻⁴ error, no transcendental calls) |
+| `precise` | | RoPE: stdlib `f32::sin_cos()`, correctly rounded; mutually exclusive with `fast` |
+
+**`fast` vs `precise`:**  Both affect how sin/cos values are computed when
+building the Rotary Positional Embedding tables in the NeuCodec transformer.
+The polynomial path (`fast`) avoids transcendental function calls — 6 FMAs per
+value — and is measurably faster at load time on platforms where hardware sin/cos
+is slow.  The accuracy difference is imperceptible in speech synthesis.  Pass
+`--features precise` to opt into full IEEE 754 accuracy:
+
+```sh
+cargo run --example speak --features "espeak,precise" -- ...
+```
+
+Setting both `fast` and `precise` simultaneously is a compile-time error.
 
 **Without `backbone`** — codec-only mode; use `NeuCodecDecoder::decode()` directly.
 
 **Without `espeak`** — pass pre-phonemized IPA via `tts.infer_from_ipa()`.
+
+---
+
+## Performance
+
+Measured on a MacBook Pro M2 with the `wgpu` feature (Metal GPU) and
+`neutts-nano-Q4_0.gguf` (0.2B parameters, 372 reference tokens, ~125 output tokens):
+
+| Version | Synth time | RTF | Notes |
+|---------|-----------|-----|-------|
+| 0.0.1 | 4.45 s | 1.79× | GPU init (1.72 s) counted against synthesis |
+| 0.0.2 | ~2.7 s | ~1.1× | GPU init moved to load time; RoPE uploads eliminated |
+
+**What changed in 0.0.2:**
+
+- **Eager GPU init** — `NeuCodecDecoder::from_file()` now initialises the Burn
+  wgpu backend immediately, moving the ~1.7 s GPU upload from synthesis latency
+  into model loading time (reported in "loaded in X s").
+- **Pre-computed RoPE tables** — cos/sin tables for up to 2048 positions are
+  computed once at weight-load time and stored as device tensors.  This
+  eliminates the 24 CPU→GPU uploads that previously occurred on every decode
+  call (12 transformer blocks × Q and K projections each).
 
 ---
 
@@ -324,7 +390,7 @@ use std::path::Path;
 // or Some("filename.gguf") to pick a specific quantisation.
 let tts = download::load_from_hub_cb(
     "neuphonic/neutts-nano-q4-gguf",
-    None,           // or Some("neutts-nano-Q4_K_M.gguf")
+    None,       // or Some("neutts-nano-Q4_K_M.gguf")
     |_| {},
 ).unwrap();
 
@@ -341,6 +407,45 @@ let audio = tts.infer(
 // Save to WAV
 tts.write_wav(&audio, Path::new("output.wav")).unwrap();
 ```
+
+### Streaming synthesis
+
+The backbone exposes a token-by-token streaming API that lets you start
+decoding audio before the model has finished generating:
+
+```rust
+use neutts::{tokens, download};
+use std::io::Write as _;
+
+let tts = download::load_from_hub_cb("neuphonic/neutts-nano-q4-gguf", None, |_| {}).unwrap();
+let ref_codes = tts.load_ref_codes("samples/dave.npy".as_ref()).unwrap();
+let ref_ipa   = neutts::phonemize::phonemize("Reference transcript.", "en-us").unwrap();
+let input_ipa = neutts::phonemize::phonemize("Hello, streaming!", "en-us").unwrap();
+let prompt    = tokens::build_prompt(&ref_ipa, &input_ipa, &ref_codes);
+
+let mut pending   = Vec::<i32>::new();
+let     codec     = &tts.codec;
+let     stdout    = std::io::stdout();
+let mut out       = std::io::BufWriter::new(stdout.lock());
+
+tts.backbone.generate_streaming(&prompt, 2048, |piece| {
+    pending.extend(tokens::extract_ids(piece));
+
+    if pending.len() >= 25 {          // 25 tokens ≈ 500 ms of audio
+        let audio = codec.decode(&pending)?;
+        for s in &audio {
+            let s16 = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            out.write_all(&s16.to_le_bytes())?;
+        }
+        out.flush()?;
+        pending.clear();
+    }
+    Ok(())
+})?;
+```
+
+See [`examples/stream_pcm.rs`](examples/stream_pcm.rs) for the full
+self-contained example with timing diagnostics and player instructions.
 
 ### Discover models programmatically
 
@@ -377,9 +482,8 @@ let audio = tts.infer_from_ipa(
 ```rust
 use neutts::NeuCodecDecoder;
 
-// Loads models/neucodec_decoder.safetensors at runtime
 let dec = NeuCodecDecoder::new().unwrap();
-println!("backend: {}", dec.backend_name()); // "cpu (ndarray)"
+println!("backend: {}", dec.backend_name()); // e.g. "burn/wgpu (GPU)"
 println!("{} samples/token", dec.hop_length());
 
 let codes: Vec<i32> = vec![/* speech token IDs */];
@@ -435,11 +539,12 @@ See [`include/neutts.h`](include/neutts.h) for the full C header.
 |-----------|--------|
 | GGUF backbone inference | ✅ |
 | NeuCodec decoder (pure Rust, safetensors) | ✅ |
-| NeuCodec encoder (pure Rust) | ⏳ not yet — `speak` example falls back to Python `neucodec` |
+| NeuCodec encoder (pure Rust) | ⏳ `speak` example falls back to Python `neucodec` |
+| GPU-accelerated codec (`wgpu` feature) | ✅ Metal / Vulkan / DX12 via Burn |
+| Streaming backbone API (`generate_streaming`) | ✅ |
+| Streaming PCM output (`stream_pcm` example) | ✅ |
 | English backbones (Nano / Air, Q4 / Q8) | ✅ |
 | German / French / Spanish backbones | ✅ |
-| Full (non-GGUF) model repos | ✅ in registry; GGUF files detected automatically |
-| GPU acceleration (codec) | ⏳ planned via `wgpu` feature |
 | iOS / Android build | ✅ codec is pure Rust; backbone needs cross-compile |
 
 ---
@@ -454,13 +559,15 @@ If you use this software in your research or project, please cite it as:
   title        = {{neutts}: Rust port of {NeuTTS} — on-device voice-cloning {TTS}
                   with {GGUF} backbone and {NeuCodec} decoder},
   year         = {2026},
-  version      = {0.0.1},
+  version      = {0.0.2},
   license      = {MIT},
   url          = {https://github.com/eugenehp/neutts-rs}
 }
 ```
 
-If you also use the underlying NeuTTS model or NeuCodec, please cite those works directly via their respective HuggingFace repositories at [huggingface.co/neuphonic](https://huggingface.co/neuphonic).
+If you also use the underlying NeuTTS model or NeuCodec, please cite those works
+directly via their respective HuggingFace repositories at
+[huggingface.co/neuphonic](https://huggingface.co/neuphonic).
 
 ---
 

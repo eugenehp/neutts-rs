@@ -36,13 +36,15 @@
 //!
 //! ## Features
 //!
-//! | Feature    | Default | Effect                                                          |
-//! |------------|---------|-----------------------------------------------------------------|
-//! | `backbone` | ✓       | GGUF backbone via llama-cpp-2 (requires cmake + C++)            |
-//! | `espeak`   |         | Raw-text input via libespeak-ng                                 |
-//! | `wgpu`     |         | GPU codec via Burn wgpu; auto-falls-back to Burn NdArray CPU    |
-//! | `metal`    |         | macOS Metal GPU for backbone                                    |
-//! | `cuda`     |         | NVIDIA CUDA for backbone                                        |
+//! | Feature    | Default | Effect                                                                       |
+//! |------------|---------|------------------------------------------------------------------------------|
+//! | `backbone` | ✓       | GGUF backbone via llama-cpp-2 (requires cmake + C++)                         |
+//! | `espeak`   |         | Raw-text input via libespeak-ng                                              |
+//! | `wgpu`     |         | GPU-accelerated codec via Burn wgpu; falls back to Burn NdArray then ndarray |
+//! | `metal`    |         | macOS Metal GPU for the backbone (passed to llama-cpp-2)                     |
+//! | `cuda`     |         | NVIDIA CUDA for the backbone (passed to llama-cpp-2)                         |
+//! | `fast`     | ✓       | RoPE: degree-7/6 Horner polynomial, no transcendental calls (~1e-4 error)    |
+//! | `precise`  |         | RoPE: stdlib `f32::sin_cos()`, correctly rounded; mutually exclusive w/ fast |
 
 // HuggingFace Hub download — desktop only (hf-hub needs OpenSSL).
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
