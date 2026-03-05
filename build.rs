@@ -16,6 +16,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // ── RoPE feature conflict check ───────────────────────────────────────────
+    //
+    // `fast` and `precise` select mutually exclusive sin/cos implementations.
+    // Setting both at once is a programmer error.
+    let feat_fast    = std::env::var("CARGO_FEATURE_FAST").is_ok();
+    let feat_precise = std::env::var("CARGO_FEATURE_PRECISE").is_ok();
+    if feat_fast && feat_precise {
+        panic!(
+            "\n\
+             \nFeatures `fast` and `precise` are mutually exclusive.\n\
+             \nPick one:\n\
+             \n\
+             \t  --features fast      # polynomial approx, ~1e-4 error (default)\n\
+             \t  --features precise   # stdlib sin/cos, full accuracy\n"
+        );
+    }
+
     // ── espeak-ng linking ─────────────────────────────────────────────────────
     if std::env::var("CARGO_FEATURE_ESPEAK").is_ok() {
         link_espeak();

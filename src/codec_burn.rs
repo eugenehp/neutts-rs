@@ -194,8 +194,13 @@ fn load_weights<B: Backend>(dw: &DecoderWeights, device: &B::Device) -> BurnWeig
                 p_f * (1.0_f32 / 10_000_f32.powf(2.0 * i as f32 / head_dim as f32));
         }
     }
-    let cos_vec: Vec<f32> = theta.iter().map(|&v| v.cos()).collect();
-    let sin_vec: Vec<f32> = theta.iter().map(|&v| v.sin()).collect();
+    // Build cos/sin tables using the same rope_sin_cos() dispatch as the CPU
+    // path — honours `fast` / `precise` feature flags and avoids two separate
+    // passes over `theta`.
+    let (sin_vec, cos_vec): (Vec<f32>, Vec<f32>) = theta
+        .iter()
+        .map(|&v| crate::codec::rope_sin_cos(v))
+        .unzip();
     let rope_cos: Tensor<B, 2> =
         Tensor::from_data(TensorData::new(cos_vec, vec![MAX_SEQ_LEN, half]), device);
     let rope_sin: Tensor<B, 2> =

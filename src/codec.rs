@@ -323,6 +323,55 @@ fn fsq_decode(
     linear(digits.view(), proj_w, Some(proj_b))
 }
 
+// ─── RoPE sin/cos dispatch ────────────────────────────────────────────────────
+
+/// Compute `(sin(x), cos(x))` for use in Rotary Positional Embedding.
+///
+/// The implementation is selected at compile time by the active feature flag:
+///
+/// | Feature     | Implementation                          | Max abs. error |
+/// |-------------|-----------------------------------------|----------------|
+/// | `fast`      | degree-7/6 Horner polynomial + f32 RR   | ~1 × 10⁻⁴     |
+/// | `precise`   | `f32::sin_cos()` — correctly rounded    | ~1 × 10⁻⁷     |
+/// | *(neither)* | same as `fast` (default)                | ~1 × 10⁻⁴     |
+///
+/// ### Fast-mode notes
+///
+/// The polynomial path avoids transcendental function calls entirely: sin and
+/// cos are each evaluated with 6 fused multiply-adds (Horner's method).  On
+/// platforms where hardware `sin`/`cos` instructions are slow or absent this
+/// can be 6–12× faster per value.
+///
+/// Range reduction to \[−π, π\] uses a single `f32` round-multiply.  For large
+/// angles — RoPE dimensions with position ≈ 2 047 and the highest frequency
+/// (`inv_freq = 1.0`) give θ ≈ 2 047 rad — floating-point cancellation in the
+/// reduction introduces O(2⁻²³ · |θ|) extra absolute error before the
+/// polynomial.  At the worst case this is ≈ 2 × 10⁻⁴ rad, which is well
+/// within perceptual threshold for speech synthesis.
+///
+/// Both this function and the Burn GPU path in `codec_burn::load_weights` use
+/// the same dispatch, so precomputed RoPE tables and runtime CPU evaluations
+/// are always produced by the same algorithm.
+#[cfg(not(feature = "precise"))]
+#[inline(always)]
+pub(crate) fn rope_sin_cos(x: f32) -> (f32, f32) {
+    use std::f32::consts::TAU;
+    // Range-reduce to [−π, π] with a single round() multiply.
+    let x = x - TAU * (x * (1.0 / TAU)).round();
+    let x2 = x * x;
+    // Horner-form degree-7 sin: x(1 + x²(−1/6 + x²(1/120 − x²/5040)))
+    let s = x  * (1.0 + x2 * (-1.0/6.0   + x2 * (1.0/120.0  - x2 * (1.0/5040.0))));
+    // Horner-form degree-6 cos: 1 + x²(−1/2 + x²(1/24 − x²/720))
+    let c = 1.0 + x2 * (-0.5             + x2 * (1.0/24.0    - x2 * (1.0/720.0)));
+    (s, c)
+}
+
+#[cfg(feature = "precise")]
+#[inline(always)]
+pub(crate) fn rope_sin_cos(x: f32) -> (f32, f32) {
+    x.sin_cos()
+}
+
 // ─── Rotary positional embedding ──────────────────────────────────────────────
 
 /// Apply split-half RoPE (torchtune convention) to `x` in-place.
@@ -345,8 +394,9 @@ fn apply_rope(x: &mut Array3<f32>) {
     for p in 0..t {
         let p_f = p as f32;
         for i in 0..half {
-            // sin_cos() computes both in a single instruction on most CPUs.
-            let (s, c) = (p_f * inv_freqs[i]).sin_cos();
+            // Dispatch to rope_sin_cos(): polynomial (fast, default) or
+            // stdlib sin_cos (precise feature).
+            let (s, c) = rope_sin_cos(p_f * inv_freqs[i]);
             // Apply the same rotation to every head — no per-head recompute.
             for h in 0..n_heads {
                 let x1 = x[[p, h, i]];

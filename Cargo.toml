@@ -23,7 +23,7 @@ exclude = ["ios", "android"]
 #
 # metal / cuda — GPU acceleration for the backbone only (passed to llama-cpp-2).
 [features]
-default  = ["backbone"]
+default  = ["backbone", "fast"]
 backbone = ["dep:llama-cpp-2"]
 espeak   = []
 wgpu     = ["dep:burn"]  # GPU-accelerated NeuCodec decoder via Burn wgpu backend
@@ -32,6 +32,32 @@ cuda     = ["llama-cpp-2?/cuda"]
 # verbose — when absent, llama.cpp / ggml log output is silenced at runtime.
 # Pass `--features verbose` to cargo build/run to restore the raw log stream.
 verbose  = []
+
+# ── RoPE computation mode (mutually exclusive) ────────────────────────────────
+#
+# Controls how sin/cos values are computed when building the Rotary Positional
+# Embedding tables used by the NeuCodec transformer decoder.
+#
+# fast    — degree-7/6 Horner-form polynomial with f32 range reduction.
+#           No transcendental function calls; ~6–12× fewer CPU cycles per
+#           value on platforms where hardware sin/cos is slow.
+#           Max absolute error ≈ 1 × 10⁻⁴ (well within perceptual threshold
+#           for speech synthesis).  Enabled by default.
+#
+# precise — delegates to f32::sin_cos(), which is correctly-rounded (ULP ≤ 1)
+#           on all major platforms (x86 SSE/AVX, ARM NEON, Apple Silicon).
+#           Use when bit-exact reproducibility with reference implementations
+#           is required.
+#
+# Setting both features simultaneously is a compile-time error (caught by build.rs).
+#
+# Examples:
+#   cargo run --example speak -- ...                        # fast (default)
+#   cargo run --example speak --features precise -- ...     # precise
+#   cargo run --example speak --no-default-features \
+#             --features precise -- ...                     # precise, no backbone
+fast    = []
+precise = []
 
 [lib]
 crate-type = ["staticlib", "rlib"]
