@@ -244,7 +244,16 @@ impl NeuTTS {
     // ── WAV output ────────────────────────────────────────────────────────────
 
     /// Write `audio` samples to a 16-bit PCM WAV file at [`SAMPLE_RATE`] Hz.
+    ///
+    /// The samples are **peak-normalised** before conversion: if the loudest
+    /// sample exceeds ±1.0 the whole signal is scaled down to just fit in
+    /// [-1, 1], preventing hard clipping.  Signals that are already within
+    /// [-1, 1] are written as-is (no amplification is applied).
     pub fn write_wav(&self, audio: &[f32], output_path: &Path) -> Result<()> {
+        // Peak normalization: scale down only if necessary, never amplify.
+        let peak = audio.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+        let scale = if peak > 1.0 { 1.0 / peak } else { 1.0 };
+
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: SAMPLE_RATE,
@@ -254,12 +263,13 @@ impl NeuTTS {
         let mut writer = hound::WavWriter::create(output_path, spec)
             .with_context(|| format!("Cannot create WAV: {}", output_path.display()))?;
         for &s in audio {
-            let s16 = (s * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            let s16 = (s * scale * i16::MAX as f32)
+                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
             writer.write_sample(s16).context("WAV write error")?;
         }
         writer.finalize().context("WAV finalise error")?;
         println!(
-            "Saved {} samples ({:.2} s) to {}",
+            "Saved {} samples ({:.2} s) to {}  [peak={peak:.4}, scale={scale:.4}]",
             audio.len(),
             audio.len() as f32 / SAMPLE_RATE as f32,
             output_path.display()

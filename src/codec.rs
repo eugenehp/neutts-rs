@@ -157,16 +157,18 @@ fn conv1d(
     let mut out = out_t.t().to_owned(); // [c_out, T]
 
     if let Some(b) = b {
-        for co in 0..c_out {
-            let bias_val = b[co];
-            out.slice_mut(s![co, ..]).mapv_inplace(|v| v + bias_val);
-        }
+        // Broadcast b [c_out] over [c_out, T] — one ndarray op, no manual loop.
+        use ndarray::Axis;
+        out += &b.view().insert_axis(Axis(1));
     }
     out
 }
 
 /// GroupNorm: `affine=True`, over input \[C, T\].
 /// Normalises over (group_size × T) elements per group.
+///
+/// Uses an iterator-based variance computation to avoid the temporary
+/// array that `block.mapv(|v| (v - mean).powi(2))` would allocate.
 fn group_norm(
     x: ArrayView2<f32>,
     n_groups: usize,
@@ -176,19 +178,25 @@ fn group_norm(
 ) -> Array2<f32> {
     let (c, t) = (x.shape()[0], x.shape()[1]);
     let group_size = c / n_groups;
+    let n = (group_size * t) as f32;
     let mut out = Array2::<f32>::zeros((c, t));
 
     for g in 0..n_groups {
         let c_start = g * group_size;
-        let c_end = c_start + group_size;
-        let block = x.slice(s![c_start..c_end, ..]);
-        let n = (group_size * t) as f32;
-        let mean = block.sum() / n;
-        let var = block.mapv(|v| (v - mean).powi(2)).sum() / n;
+        let c_end   = c_start + group_size;
+        let block   = x.slice(s![c_start..c_end, ..]);
+
+        // Mean — no temporary allocation
+        let mean = block.iter().sum::<f32>() / n;
+        // Variance — single pass, no temporary allocation
+        let var  = block.iter().map(|&v| { let d = v - mean; d * d }).sum::<f32>() / n;
         let inv_std = 1.0 / (var + eps).sqrt();
+
         for ci in c_start..c_end {
+            let scale = inv_std * w[ci];
+            let shift = b[ci];
             for ti in 0..t {
-                out[[ci, ti]] = (x[[ci, ti]] - mean) * inv_std * w[ci] + b[ci];
+                out[[ci, ti]] = (x[[ci, ti]] - mean) * scale + shift;
             }
         }
     }
@@ -196,6 +204,9 @@ fn group_norm(
 }
 
 /// LayerNorm over the last axis of \[T, C\].
+///
+/// Uses iterator sums to avoid the temporary arrays that `row.mapv(…).sum()`
+/// would allocate for each of the T rows.
 fn layer_norm(
     x: ArrayView2<f32>,
     w: ArrayView1<f32>,
@@ -203,11 +214,12 @@ fn layer_norm(
     eps: f32,
 ) -> Array2<f32> {
     let (t, c) = (x.shape()[0], x.shape()[1]);
+    let c_f = c as f32;
     let mut out = Array2::<f32>::zeros((t, c));
     for ti in 0..t {
         let row = x.slice(s![ti, ..]);
-        let mean = row.sum() / c as f32;
-        let var = row.mapv(|v| (v - mean).powi(2)).sum() / c as f32;
+        let mean = row.iter().sum::<f32>() / c_f;
+        let var  = row.iter().map(|&v| { let d = v - mean; d * d }).sum::<f32>() / c_f;
         let inv_std = 1.0 / (var + eps).sqrt();
         for ci in 0..c {
             out[[ti, ci]] = (x[[ti, ci]] - mean) * inv_std * w[ci] + b[ci];
@@ -217,12 +229,16 @@ fn layer_norm(
 }
 
 /// RMSNorm over the last axis of \[T, C\].
+///
+/// Uses an iterator sum to avoid the temporary array that `row.mapv(|v|
+/// v*v).sum()` would allocate for each of the T rows.
 fn rms_norm(x: ArrayView2<f32>, w: ArrayView1<f32>, eps: f32) -> Array2<f32> {
     let (t, c) = (x.shape()[0], x.shape()[1]);
+    let c_f = c as f32;
     let mut out = Array2::<f32>::zeros((t, c));
     for ti in 0..t {
         let row = x.slice(s![ti, ..]);
-        let ms = row.mapv(|v| v * v).sum() / c as f32;
+        let ms    = row.iter().map(|&v| v * v).sum::<f32>() / c_f;
         let scale = 1.0 / (ms + eps).sqrt();
         for ci in 0..c {
             out[[ti, ci]] = x[[ti, ci]] * scale * w[ci];
@@ -286,23 +302,30 @@ fn fsq_decode(
 /// Apply split-half RoPE (torchtune convention) to `x` in-place.
 ///
 /// * `x`: \[T, n_heads, head_dim\]
+///
+/// The outer loop order is `(position, freq_index, head)` so each
+/// `sin_cos()` result is computed **once per (position, freq)** and reused
+/// across all heads — previously it was computed once per (position, freq,
+/// head), allocating a fresh `Vec<f32>` for each position.
 fn apply_rope(x: &mut Array3<f32>) {
     let (t, n_heads, head_dim) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let half = head_dim / 2;
 
-    // Precompute (cos, sin) for each (position, freq) pair
-    let freqs: Vec<f32> = (0..half)
+    // Inverse frequencies — only `half` f32 values, computed once.
+    let inv_freqs: Vec<f32> = (0..half)
         .map(|i| 1.0_f32 / 10_000_f32.powf(2.0 * i as f32 / head_dim as f32))
         .collect();
 
     for p in 0..t {
-        let theta: Vec<f32> = freqs.iter().map(|&f| p as f32 * f).collect();
-        for h in 0..n_heads {
-            for i in 0..half {
-                let (c, s) = (theta[i].cos(), theta[i].sin());
+        let p_f = p as f32;
+        for i in 0..half {
+            // sin_cos() computes both in a single instruction on most CPUs.
+            let (s, c) = (p_f * inv_freqs[i]).sin_cos();
+            // Apply the same rotation to every head — no per-head recompute.
+            for h in 0..n_heads {
                 let x1 = x[[p, h, i]];
                 let x2 = x[[p, h, i + half]];
-                x[[p, h, i]] = x1 * c - x2 * s;
+                x[[p, h, i]]        = x1 * c - x2 * s;
                 x[[p, h, i + half]] = x1 * s + x2 * c;
             }
         }
@@ -458,6 +481,7 @@ pub(crate) fn istft_burn(
     phase: ArrayView2<f32>,
     hop: usize,
     window: &[f32],
+    ifft: &dyn rustfft::Fft<f32>,
 ) -> Vec<f32> {
     let n_bins = mag.shape()[0]; // n_fft/2 + 1
     let n_frames = mag.shape()[1];
@@ -469,9 +493,6 @@ pub(crate) fn istft_burn(
     let out_size = (n_frames - 1) * hop + n_fft;
     let mut y   = vec![0.0f32; out_size];
     let mut env = vec![0.0f32; out_size];
-
-    let mut planner = FftPlanner::<f32>::new();
-    let ifft = planner.plan_fft_inverse(n_fft);
 
     let mut buf = vec![Complex::<f32>::default(); n_fft];
 
@@ -571,6 +592,10 @@ pub(crate) struct DecoderWeights {
     pub(crate) hop_length: usize,
     pub(crate) depth: usize,
     pub(crate) n_heads: usize,
+
+    // Cached IFFT plan — created once at load time so the plan cache is not
+    // discarded between decode() calls.
+    pub(crate) ifft_plan: std::sync::Arc<dyn rustfft::Fft<f32>>,
 }
 
 fn load_resnet_block(st: &SafeTensors<'_>, prefix: &str, c: usize) -> Result<ResnetBlockWeights> {
@@ -737,6 +762,14 @@ fn load_decoder_weights(
         hann_window(n_fft)
     };
 
+    // Build the IFFT plan once at load time — the FftPlanner caches plans
+    // internally, but recreating the planner on each decode() call would
+    // silently discard that cache and re-plan from scratch every time.
+    let ifft_plan = {
+        let mut planner = FftPlanner::<f32>::new();
+        planner.plan_fft_inverse(n_fft)
+    };
+
     Ok(DecoderWeights {
         fsq_proj_w,
         fsq_proj_b,
@@ -756,6 +789,7 @@ fn load_decoder_weights(
         hop_length,
         depth,
         n_heads,
+        ifft_plan,
     })
 }
 
@@ -820,8 +854,8 @@ fn decode_forward(codes: &[i32], w: &DecoderWeights) -> Vec<f32> {
     let mag = x_pred_ct.slice(s![0..half, ..]).to_owned();
     let phase = x_pred_ct.slice(s![half.., ..]).to_owned();
 
-    // 10. ISTFT
-    istft_burn(mag.view(), phase.view(), hop, &w.window)
+    // 10. ISTFT — use the pre-built plan from DecoderWeights
+    istft_burn(mag.view(), phase.view(), hop, &w.window, w.ifft_plan.as_ref())
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -924,11 +958,24 @@ impl NeuCodecDecoder {
 
     /// Decode speech token IDs to a 24 kHz audio waveform.
     ///
-    /// * `codes` — integer token IDs (typically 0..65535 for NeuCodec FSQ).
+    /// * `codes` — integer token IDs in `0..=65535` (NeuCodec FSQ range).
+    ///   Out-of-range values are rejected with an error rather than silently
+    ///   producing garbage digits from the FSQ decomposition.
     /// * returns — `Vec<f32>` of `codes.len() × hop_length` samples.
     pub fn decode(&self, codes: &[i32]) -> Result<Vec<f32>> {
         if codes.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // Validate before touching any weights — an out-of-range code would
+        // silently produce wrong FSQ digits (e.g. a negative modulo result).
+        for (i, &code) in codes.iter().enumerate() {
+            if !(0..=65535).contains(&code) {
+                anyhow::bail!(
+                    "Speech token at index {i} is out of range: {code} \
+                     (NeuCodec FSQ codes must be in 0..=65535)"
+                );
+            }
         }
 
         // ── Prefer Burn-accelerated path (wgpu GPU or NdArray CPU via Burn) ──
@@ -1165,6 +1212,10 @@ mod tests {
         assert!((w[2] - 1.0).abs() < 1e-6);
     }
 
+    fn make_ifft(n_fft: usize) -> std::sync::Arc<dyn rustfft::Fft<f32>> {
+        FftPlanner::<f32>::new().plan_fft_inverse(n_fft)
+    }
+
     #[test]
     fn test_istft_length() {
         let hop = 4;
@@ -1175,7 +1226,8 @@ mod tests {
         let mag   = Array2::zeros((n_bins, t));
         let phase = Array2::zeros((n_bins, t));
         let win   = hann_window(n_fft);
-        let audio = istft_burn(mag.view(), phase.view(), hop, &win);
+        let ifft  = make_ifft(n_fft);
+        let audio = istft_burn(mag.view(), phase.view(), hop, &win, ifft.as_ref());
         // center=True: output is exactly T*hop samples
         assert_eq!(audio.len(), t * hop, "expected {} samples, got {}", t * hop, audio.len());
     }
@@ -1192,7 +1244,8 @@ mod tests {
         let mag   = Array2::from_elem((n_bins, t), 50.0f32);
         let phase = Array2::zeros((n_bins, t));
         let win   = hann_window(n_fft);
-        let audio = istft_burn(mag.view(), phase.view(), hop, &win);
+        let ifft  = make_ifft(n_fft);
+        let audio = istft_burn(mag.view(), phase.view(), hop, &win, ifft.as_ref());
         // All samples must be finite and ≤ some reasonable bound (the clamp
         // limits linear magnitude to 1e2, so waveform values should be bounded)
         for &s in &audio {

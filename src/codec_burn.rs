@@ -105,6 +105,9 @@ struct BurnWeights<B: Backend> {
     head_b:       Tensor<B, 1>,  // [n_fft+2]
     // ISTFT (stays on CPU)
     window:       Vec<f32>,
+    // Pre-built IFFT plan — shared from DecoderWeights so we don't re-plan
+    // on every decode() call.
+    ifft_plan:    std::sync::Arc<dyn rustfft::Fft<f32>>,
     // Hyper-parameters
     hop_length:   usize,
     n_heads:      usize,
@@ -183,6 +186,7 @@ fn load_weights<B: Backend>(dw: &DecoderWeights, device: &B::Device) -> BurnWeig
         head_w:       a2_to_t2(&dw.head_w, device),
         head_b:       a1_to_t1(&dw.head_b, device),
         window:       dw.window.clone(),
+        ifft_plan:    std::sync::Arc::clone(&dw.ifft_plan),
         hop_length:   dw.hop_length,
         n_heads:      dw.n_heads,
         embed_pad,
@@ -470,8 +474,8 @@ fn burn_decode<B: Backend>(codes: &[i32], w: &BurnWeights<B>) -> Vec<f32> {
     let mag_a   = ndarray::Array2::from_shape_vec((half, t), mag)  .expect("mag shape");
     let phase_a = ndarray::Array2::from_shape_vec((half, t), phase).expect("phase shape");
 
-    // 11. ISTFT (CPU, rustfft)
-    istft_burn(mag_a.view(), phase_a.view(), hop, &w.window)
+    // 11. ISTFT (CPU, rustfft) — use the pre-built plan stored in DecoderWeights
+    istft_burn(mag_a.view(), phase_a.view(), hop, &w.window, w.ifft_plan.as_ref())
 }
 
 // ─── Concrete decoder implementations ────────────────────────────────────────
@@ -505,12 +509,17 @@ where
 /// to the raw ndarray decoder).
 pub(crate) fn make_burn_decoder(dw: &DecoderWeights) -> Option<Box<dyn BurnDecoder + Send>> {
     // ── Attempt 1: wgpu GPU ───────────────────────────────────────────────────
-    let wgpu_result = std::panic::catch_unwind(|| {
+    //
+    // `DecoderWeights` contains `Arc<dyn Fft<f32>>` which doesn't implement
+    // `RefUnwindSafe` (the trait object may have interior mutability).  We
+    // know the IFFT plan is only read here (no mutation across the unwind
+    // boundary), so wrapping in `AssertUnwindSafe` is sound.
+    let wgpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let device = WgpuDevice::DefaultDevice;
         let weights = load_weights::<Wgpu>(dw, &device);
         Box::new(BurnDecoderImpl::<Wgpu> { weights, name: "burn/wgpu (GPU)" })
             as Box<dyn BurnDecoder + Send>
-    });
+    }));
 
     if let Ok(dec) = wgpu_result {
         println!("NeuCodec: using Burn wgpu (GPU) backend");
@@ -518,12 +527,12 @@ pub(crate) fn make_burn_decoder(dw: &DecoderWeights) -> Option<Box<dyn BurnDecod
     }
 
     // ── Attempt 2: Burn NdArray CPU ──────────────────────────────────────────
-    let ndarray_result = std::panic::catch_unwind(|| {
+    let ndarray_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let device = NdArrayDevice::Cpu;
         let weights = load_weights::<NdArray>(dw, &device);
         Box::new(BurnDecoderImpl::<NdArray> { weights, name: "burn/ndarray (CPU)" })
             as Box<dyn BurnDecoder + Send>
-    });
+    }));
 
     match ndarray_result {
         Ok(dec) => {

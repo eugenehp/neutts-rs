@@ -20,7 +20,10 @@ static RE_SPEECH_TOKEN: Lazy<Regex> =
 /// Convert a slice of codec token IDs to the text representation used in
 /// the model prompt, e.g. `[0, 5, 42]` → `"<|speech_0|><|speech_5|><|speech_42|>"`.
 pub fn ids_to_token_str(ids: &[i32]) -> String {
-    let mut s = String::with_capacity(ids.len() * 14);
+    // "<|speech_1023|>" = 15 chars (the longest possible token string).
+    // Using 14 previously caused one reallocation for every utterance that
+    // contained any 4-digit ID (≥ 1000).
+    let mut s = String::with_capacity(ids.len() * 15);
     for &id in ids {
         s.push_str(&format!("<|speech_{id}|>"));
     }
