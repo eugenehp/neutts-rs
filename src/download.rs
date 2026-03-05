@@ -960,12 +960,78 @@ fn parse_pickle_metadata(pkl: &[u8]) -> Result<std::collections::BTreeMap<String
 pub fn load_from_hub_cb<F>(
     backbone_repo: &str,
     gguf_file: Option<&str>,
+    on_progress: F,
+) -> Result<NeuTTS>
+where
+    F: FnMut(LoadProgress),
+{
+    // Default: HuggingFace global cache (~/.cache/huggingface/hub) and the
+    // relative "models/" decoder path used by neutts-rs examples/tests.
+    load_from_hub_cb_impl(
+        backbone_repo, gguf_file,
+        /* model_dir */ None,
+        on_progress,
+    )
+}
+
+/// Like [`load_from_hub_cb`] but stores **all** downloaded files inside
+/// `model_dir` instead of the global HuggingFace cache.
+///
+/// Layout inside `model_dir`:
+/// ```text
+/// model_dir/
+///   hub/                          ← hf-hub cache (GGUF backbone, pytorch_model.bin)
+///   neucodec_decoder.safetensors  ← converted NeuCodec decoder
+/// ```
+///
+/// Creating `model_dir` is the caller's responsibility.
+#[cfg(feature = "backbone")]
+pub fn load_from_hub_cb_at<F>(
+    backbone_repo: &str,
+    gguf_file:     Option<&str>,
+    model_dir:     &Path,
+    on_progress:   F,
+) -> Result<NeuTTS>
+where
+    F: FnMut(LoadProgress),
+{
+    load_from_hub_cb_impl(
+        backbone_repo, gguf_file,
+        Some(model_dir),
+        on_progress,
+    )
+}
+
+// ─── Shared implementation ────────────────────────────────────────────────────
+
+fn load_from_hub_cb_impl<F>(
+    backbone_repo: &str,
+    gguf_file:     Option<&str>,
+    model_dir:     Option<&Path>,
     mut on_progress: F,
 ) -> Result<NeuTTS>
 where
     F: FnMut(LoadProgress),
 {
-    let api = Api::new().context("Failed to initialise HuggingFace Hub client")?;
+    // Build hf-hub API + cache — either rooted at model_dir or the global default.
+    let (api, cache): (Api, Cache) = match model_dir {
+        Some(dir) => {
+            let hub_dir = dir.join("hub");
+            std::fs::create_dir_all(&hub_dir)
+                .with_context(|| format!("Cannot create hub cache dir: {}", hub_dir.display()))?;
+            let cache = Cache::new(hub_dir.clone());
+            let api   = ApiBuilder::new()
+                .with_cache_dir(hub_dir)
+                .build()
+                .context("Failed to initialise HuggingFace Hub client")?;
+            (api, cache)
+        }
+        None => {
+            let api   = Api::new().context("Failed to initialise HuggingFace Hub client")?;
+            let cache = Cache::from_env();
+            (api, cache)
+        }
+    };
 
     // ── Step 1/3: Download GGUF backbone ──────────────────────────────────────
     let backbone_size_mb = find_model(backbone_repo).map(|m| m.size_mb);
@@ -976,7 +1042,6 @@ where
         repo: backbone_repo.into(),
         size_mb: backbone_size_mb,
     });
-    // Resolve the actual GGUF filename first (may require a repo listing).
     let resolved_gguf: String = match gguf_file {
         Some(fname) => fname.to_string(),
         None => {
@@ -986,36 +1051,36 @@ where
                 .with_context(|| format!("No .gguf file found in '{backbone_repo}'"))?
         }
     };
-    let backbone_path = hf_download_cb(&api, backbone_repo, &resolved_gguf, |dl, tot| {
+    let backbone_path = hf_download_cb(&api, &cache, backbone_repo, &resolved_gguf, |dl, tot| {
         on_progress(LoadProgress::Downloading { step: 1, total: 3, downloaded: dl, total_bytes: tot });
     }).with_context(|| format!("Failed to download '{resolved_gguf}' from '{backbone_repo}'"))?;
 
     // ── Step 2/3: Obtain NeuCodec decoder safetensors ────────────────────────
     //
-    // neuphonic/neucodec does NOT publish a pre-built safetensors file; it
-    // distributes `pytorch_model.bin`.  We:
-    //   a) Check whether a converted safetensors already exists locally.
-    //   b) If not, download `pytorch_model.bin` from HuggingFace and convert
-    //      it in-process using our pure-Python converter (no PyTorch needed).
-    let local_decoder = std::path::Path::new(CODEC_DECODER_LOCAL);
+    // The decoder is stored either in `model_dir/neucodec_decoder.safetensors`
+    // (when model_dir is supplied) or in the legacy relative path
+    // `models/neucodec_decoder.safetensors` (default behaviour).
+    let local_decoder: PathBuf = match model_dir {
+        Some(dir) => dir.join(CODEC_DECODER_FILE),
+        None      => PathBuf::from(CODEC_DECODER_LOCAL),
+    };
+
     let decoder_path: PathBuf = if local_decoder.exists() {
-        // Fast path: already converted from a previous run.
         on_progress(LoadProgress::Fetching {
             step: 2, total: 3,
             file: CODEC_DECODER_FILE.into(),
             repo: "(local cache)".into(),
             size_mb: None,
         });
-        local_decoder.to_path_buf()
+        local_decoder
     } else {
-        // Download pytorch_model.bin and convert.
         on_progress(LoadProgress::Fetching {
             step: 2, total: 3,
             file: CODEC_SOURCE_FILE.into(),
             repo: CODEC_DECODER_REPO.into(),
             size_mb: Some(CODEC_DECODER_SIZE_MB),
         });
-        let bin_path = hf_download_cb(&api, CODEC_DECODER_REPO, CODEC_SOURCE_FILE, |dl, tot| {
+        let bin_path = hf_download_cb(&api, &cache, CODEC_DECODER_REPO, CODEC_SOURCE_FILE, |dl, tot| {
             on_progress(LoadProgress::Downloading {
                 step: 2, total: 3, downloaded: dl, total_bytes: tot,
             });
@@ -1023,14 +1088,13 @@ where
             "Failed to download '{CODEC_SOURCE_FILE}' from '{CODEC_DECODER_REPO}'"
         ))?;
 
-        // Convert pytorch_model.bin → safetensors using the bundled script.
         on_progress(LoadProgress::Loading {
             step: 2, total: 3,
             component: format!("converting {CODEC_SOURCE_FILE} → {CODEC_DECODER_FILE}"),
         });
-        convert_checkpoint(&bin_path, local_decoder)
+        convert_checkpoint(&bin_path, &local_decoder)
             .context("Failed to convert NeuCodec checkpoint to safetensors")?;
-        local_decoder.to_path_buf()
+        local_decoder
     };
 
     // ── Step 3/3: Load backbone + decoder ─────────────────────────────────────
