@@ -428,13 +428,28 @@ fn resnet_block(x: ArrayView2<f32>, w: &ResnetBlockWeights) -> Array2<f32> {
 
 // ─── ISTFT ────────────────────────────────────────────────────────────────────
 
-/// Inverse STFT with "same" padding.
+/// Inverse STFT matching PyTorch `torch.istft(..., center=True)`.
 ///
-/// * `mag`: \[n_fft/2+1, T\]  real magnitudes
-/// * `phase`: \[n_fft/2+1, T\] real phase angles
+/// * `mag`: \[n_fft/2+1, T\]  **log**-magnitudes (the model head outputs log-mag)
+/// * `phase`: \[n_fft/2+1, T\] phase angles in radians
 /// * `hop`: hop length (= n_fft / 4)
 /// * `window`: Hann window \[n_fft\]
-/// * returns: waveform \[T × hop\]
+/// * returns: waveform of exactly `T × hop` samples
+///
+/// ### Two bugs this function previously had (now fixed)
+///
+/// 1. **Clamp-before-exp** — the original code did `mag.min(1e2).exp()`, which
+///    caps the *log*-magnitude at 100 (meaning `exp(100) ≈ 2.7e43` for large
+///    bins).  The correct Python behaviour is `exp(mag).clamp(max=1e2)` — clamp
+///    the *linear* magnitude to 100.  Large log-magnitude bins (common for
+///    loud/low-frequency speech) therefore blew up, drowning out high-frequency
+///    content and causing muffled output.
+///
+/// 2. **Wrong center trim** — PyTorch's `center=True` removes `n_fft/2` samples
+///    from the **start** of the OLA buffer and then takes exactly `T*hop`
+///    samples.  The old code instead removed `(n_fft-hop)/2` from **both ends**,
+///    which is a 240-sample temporal offset (at 24 kHz with hop=480) and
+///    includes partially-overlapped edge frames with poor reconstruction quality.
 ///
 /// `pub(crate)` so the Burn decoder in `codec_burn.rs` can call it after
 /// pulling the head output back from the device.
@@ -450,11 +465,9 @@ pub(crate) fn istft_burn(
     debug_assert_eq!(n_fft, window.len());
     debug_assert_eq!(hop, n_fft / 4);
 
-    let pad = (n_fft - hop) / 2; // "same" padding trim amount
-
-    // Output buffer (before trimming)
+    // Output buffer length before trimming
     let out_size = (n_frames - 1) * hop + n_fft;
-    let mut y = vec![0.0f32; out_size];
+    let mut y   = vec![0.0f32; out_size];
     let mut env = vec![0.0f32; out_size];
 
     let mut planner = FftPlanner::<f32>::new();
@@ -463,39 +476,52 @@ pub(crate) fn istft_burn(
     let mut buf = vec![Complex::<f32>::default(); n_fft];
 
     for ti in 0..n_frames {
-        // Build the complex spectrum from magnitude + phase
+        // Build the complex spectrum from log-magnitude + phase angle.
+        //
+        // FIX 1: exp() first, then clamp — matching PyTorch's
+        //   `mag = torch.exp(mag).clamp(max=1e2)`
+        // The old `.min(1e2).exp()` capped the log-magnitude at 100, which
+        // effectively allowed linear magnitudes up to exp(100) ≈ 2.7e43.
         for fi in 0..n_bins {
-            let m = mag[[fi, ti]].min(1e2).exp();
+            let m = mag[[fi, ti]].exp().min(1e2); // ← fixed: clamp linear mag
             let p = phase[[fi, ti]];
             buf[fi] = Complex::new(m * p.cos(), m * p.sin());
         }
-        // Hermitian symmetry: buf[n_fft - fi] = conj(buf[fi])  for fi in 1..n_bins-1
+        // Hermitian symmetry for real IFFT output
         for fi in 1..n_bins - 1 {
             buf[n_fft - fi] = buf[fi].conj();
         }
 
-        // Inverse FFT (rustfft performs in-place, unnormalized)
+        // Inverse FFT (rustfft is unnormalized — we divide by n_fft below)
         ifft.process(&mut buf);
 
-        // Normalise + apply window, then overlap-add
+        // Normalize + apply synthesis window, then overlap-add
         let norm = n_fft as f32;
         let offset = ti * hop;
         for i in 0..n_fft {
             let sample = buf[i].re / norm * window[i];
-            y[offset + i] += sample;
+            y[offset + i]   += sample;
             env[offset + i] += window[i] * window[i];
         }
     }
 
-    // Normalise by window envelope and trim same-padding
+    // Weighted overlap-add normalization
     for i in 0..out_size {
         if env[i] > 1e-11 {
             y[i] /= env[i];
         }
     }
 
-    // Trim pad samples from each end (same-padding)
-    y[pad..out_size - pad].to_vec()
+    // FIX 2: match PyTorch center=True — trim n_fft/2 from the START only,
+    // then take exactly T*hop samples.
+    //
+    // Old code: y[(n_fft-hop)/2 .. out_size-(n_fft-hop)/2]
+    //   → 240-sample temporal offset + includes edge frames with 1-2 overlaps.
+    // Correct:  y[n_fft/2 .. n_fft/2 + T*hop]
+    //   → first fully-overlapped sample (≥4 frames) through end of signal.
+    let start  = n_fft / 2;
+    let length = n_frames * hop;
+    y[start..start + length].to_vec()
 }
 
 /// Hann window of length `n`.
@@ -1145,12 +1171,34 @@ mod tests {
         let n_fft = 16; // hop * 4
         let t = 10;
         let n_bins = n_fft / 2 + 1; // 9
-        let mag = Array2::zeros((n_bins, t));
+        // Zero mag → exp(0)=1 magnitude, zero phase → cos(0)=1, sin(0)=0
+        let mag   = Array2::zeros((n_bins, t));
         let phase = Array2::zeros((n_bins, t));
-        let win = hann_window(n_fft);
+        let win   = hann_window(n_fft);
         let audio = istft_burn(mag.view(), phase.view(), hop, &win);
-        // Expected: t * hop samples
+        // center=True: output is exactly T*hop samples
         assert_eq!(audio.len(), t * hop, "expected {} samples, got {}", t * hop, audio.len());
+    }
+
+    #[test]
+    fn test_istft_clamp_does_not_blow_up() {
+        // Log-magnitudes well above ln(100)≈4.6 must be clamped to 100 (linear),
+        // not allowed to reach exp(large) ≈ infinity.
+        let hop   = 4;
+        let n_fft = 16;
+        let t     = 4;
+        let n_bins = n_fft / 2 + 1;
+        // All log-magnitudes = 50 (would give exp(50) ≈ 5e21 without the fix)
+        let mag   = Array2::from_elem((n_bins, t), 50.0f32);
+        let phase = Array2::zeros((n_bins, t));
+        let win   = hann_window(n_fft);
+        let audio = istft_burn(mag.view(), phase.view(), hop, &win);
+        // All samples must be finite and ≤ some reasonable bound (the clamp
+        // limits linear magnitude to 1e2, so waveform values should be bounded)
+        for &s in &audio {
+            assert!(s.is_finite(), "sample is not finite: {s}");
+            assert!(s.abs() < 1e6,  "sample magnitude suspiciously large: {s}");
+        }
     }
 
     #[test]
