@@ -125,3 +125,7 @@ required-features = ["backbone", "espeak"]
 [[example]]
 name = "download_models"
 path = "examples/download_models.rs"
+
+[[example]]
+name = "convert_weights"
+path = "examples/convert_weights.rs"

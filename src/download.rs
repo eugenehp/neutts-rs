@@ -331,7 +331,7 @@ pub const CODEC_DECODER_SIZE_MB: u32 = 1_100;
 /// | Step | What                                                   |
 /// |------|--------------------------------------------------------|
 /// | 1/3  | Fetch backbone GGUF from `backbone_repo`               |
-/// | 2/3  | Fetch NeuCodec decoder safetensors from `eugenehp/neucodec`  | // neuphonic/neucoded
+/// | 2/3  | Fetch NeuCodec decoder safetensors from `neuphonic/neucodec`
 /// | 3/3  | Load backbone into llama.cpp + initialise decoder      |
 ///
 /// # Arguments
@@ -353,7 +353,33 @@ pub const CODEC_DECODER_SIZE_MB: u32 = 1_100;
 /// pickle header to recover tensor storage keys and shapes, then read the raw
 /// float32 bytes and write them out via the `safetensors` crate.  No Python
 /// or PyTorch installation is required.
+///
+/// # Arguments
+///
+/// * `bin_path`  — Path to a PyTorch `pytorch_model.bin` ZIP archive.
+/// * `out_path`  — Destination for the generated `.safetensors` file.
+/// * `n_heads`   — Number of attention heads to record in the safetensors
+///                 metadata (default used by neuphonic/neucodec is `16`).
+/// * `repo`      — HuggingFace repo ID recorded in the metadata (for
+///                 provenance; does not affect the weights themselves).
+///
+/// Only tensors whose names start with `"generator."` or `"fc_post_a."` are
+/// written — the rest of the checkpoint (encoder, quantiser training state,
+/// …) is discarded.
+pub fn convert_neucodec_checkpoint(
+    bin_path: &std::path::Path,
+    out_path: &std::path::Path,
+    n_heads:  u32,
+    repo:     &str,
+) -> Result<()> {
+    convert_checkpoint_inner(bin_path, out_path, n_heads, repo)
+}
+
 fn convert_checkpoint(bin_path: &std::path::Path, out_path: &std::path::Path) -> Result<()> {
+    convert_checkpoint_inner(bin_path, out_path, 16, CODEC_DECODER_REPO)
+}
+
+fn convert_checkpoint_inner(bin_path: &std::path::Path, out_path: &std::path::Path, n_heads: u32, repo: &str) -> Result<()> {
     use std::io::Read;
     use zip::ZipArchive;
     use safetensors::tensor::TensorView;
@@ -460,9 +486,9 @@ fn convert_checkpoint(bin_path: &std::path::Path, out_path: &std::path::Path) ->
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("hidden_dim".to_string(), hidden_dim.to_string());
     metadata.insert("depth".to_string(),      depth.to_string());
-    metadata.insert("n_heads".to_string(),    "16".to_string());
+    metadata.insert("n_heads".to_string(),    n_heads.to_string());
     metadata.insert("hop_length".to_string(), hop_length.to_string());
-    metadata.insert("source".to_string(),     CODEC_DECODER_REPO.to_string());
+    metadata.insert("source".to_string(),     repo.to_string());
 
     // Write
     std::fs::create_dir_all(out_path.parent().unwrap_or(std::path::Path::new(".")))
