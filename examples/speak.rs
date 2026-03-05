@@ -228,10 +228,21 @@ fn main() -> anyhow::Result<()> {
     let tts = neutts::download::load_from_hub_cb(&backbone, gguf_file.as_deref(), |p| {
         use neutts::download::LoadProgress;
         match &p {
-            LoadProgress::Fetching { step, total, file, repo } =>
+            LoadProgress::Fetching { step, total, file, repo, .. } =>
                 println!("  [{step}/{total}] Fetching {file} from {repo}…"),
-            LoadProgress::Loading { step, total, component } =>
-                println!("  [{step}/{total}] Loading {component}…"),
+            LoadProgress::Downloading { step, total, downloaded, total_bytes } => {
+                let pct = if *total_bytes > 0 {
+                    (*downloaded as f64 / *total_bytes as f64 * 100.0) as u32
+                } else { 0 };
+                print!("\r  [{step}/{total}] {pct:3}%  ({:.1} / {:.1} MB)",
+                    *downloaded as f64 / 1_048_576.0,
+                    *total_bytes  as f64 / 1_048_576.0);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            LoadProgress::Loading { step, total, component } => {
+                println!();
+                println!("  [{step}/{total}] Loading {component}…");
+            }
         }
     })?;
     println!("  → codec : {}", tts.codec.backend_name());

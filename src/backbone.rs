@@ -54,8 +54,12 @@ impl BackboneModel {
     /// The backbone uses all available CPU threads by default.  Enable the
     /// `metal` or `cuda` Cargo features for GPU acceleration.
     pub fn load(path: &Path, n_ctx: u32) -> Result<Self> {
-        let backend = LlamaBackend::init()
+        let mut backend = LlamaBackend::init()
             .context("Failed to initialise llama.cpp backend")?;
+
+        // Silence llama.cpp / ggml stderr spam unless the `verbose` feature is on.
+        #[cfg(not(feature = "verbose"))]
+        backend.void_logs();
         let model_params = LlamaModelParams::default();
         let model = LlamaModel::load_from_file(&backend, path, &model_params)
             .with_context(|| format!("Cannot load GGUF model: {}", path.display()))?;

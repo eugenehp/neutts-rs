@@ -40,7 +40,7 @@
 //! |------------|---------|-----------------------------------------------------------------|
 //! | `backbone` | ✓       | GGUF backbone via llama-cpp-2 (requires cmake + C++)            |
 //! | `espeak`   |         | Raw-text input via libespeak-ng                                 |
-//! | `wgpu`     |         | Reserved for future GPU codec acceleration (currently no-op)    |
+//! | `wgpu`     |         | GPU codec via Burn wgpu; auto-falls-back to Burn NdArray CPU    |
 //! | `metal`    |         | macOS Metal GPU for backbone                                    |
 //! | `cuda`     |         | NVIDIA CUDA for backbone                                        |
 
@@ -60,6 +60,11 @@ pub mod npy;
 pub mod phonemize;
 pub mod preprocess;
 pub mod tokens;
+
+/// Burn wgpu/NdArray backend for the NeuCodec decoder.
+/// Only compiled when the `wgpu` Cargo feature is enabled.
+#[cfg(feature = "wgpu")]
+pub(crate) mod codec_burn;
 
 // ─── Re-exports ───────────────────────────────────────────────────────────────
 

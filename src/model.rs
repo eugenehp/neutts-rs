@@ -92,15 +92,24 @@ impl NeuTTS {
     ///
     /// The Burn codec decoder uses the weights compiled into the binary (from
     /// the build-time ONNX conversion).  No codec path is needed at runtime.
+    /// Load from a backbone GGUF and an explicit decoder safetensors path.
+    ///
+    /// Prefer this over [`load`] when the decoder weights are stored in a
+    /// location other than `models/neucodec_decoder.safetensors` — e.g. when
+    /// they have been downloaded by hf-hub into the HuggingFace cache.
     #[cfg(feature = "backbone")]
-    pub fn load(backbone_path: &Path, language: &str) -> Result<Self> {
-        println!("Loading backbone: {}", backbone_path.display());
+    pub fn load_with_decoder(
+        backbone_path: &Path,
+        decoder_path:  &Path,
+        language:      &str,
+    ) -> Result<Self> {
+        eprintln!("[neutts] Loading backbone: {}", backbone_path.display());
         let backbone = BackboneModel::load(backbone_path, DEFAULT_N_CTX)
             .context("Failed to load backbone")?;
 
-        println!("Initialising NeuCodec Burn decoder…");
-        let codec = NeuCodecDecoder::new()
-            .context("Failed to initialise NeuCodec Burn decoder")?;
+        eprintln!("[neutts] Loading NeuCodec decoder: {}", decoder_path.display());
+        let codec = NeuCodecDecoder::from_file(decoder_path)
+            .with_context(|| format!("Failed to load NeuCodec decoder from {}", decoder_path.display()))?;
 
         Ok(Self {
             backbone,
@@ -108,6 +117,18 @@ impl NeuTTS {
             language: language.to_string(),
             config: GenerationConfig::default(),
         })
+    }
+
+    /// Load from a backbone GGUF, resolving the decoder from the default path
+    /// (`models/neucodec_decoder.safetensors`).
+    ///
+    /// For most runtime use, prefer [`load_with_decoder`] with a path returned
+    /// by [`crate::download::load_from_hub_cb`], which downloads and caches
+    /// both files via hf-hub.
+    #[cfg(feature = "backbone")]
+    pub fn load(backbone_path: &Path, language: &str) -> Result<Self> {
+        let decoder_path = std::path::Path::new("models/neucodec_decoder.safetensors");
+        Self::load_with_decoder(backbone_path, decoder_path, language)
     }
 
     /// Load NeuTTS with only the codec (no backbone).
@@ -132,6 +153,17 @@ impl NeuTTS {
     pub fn load_ref_codes(&self, path: &Path) -> Result<Vec<i32>> {
         npy::load_npy_i32(path)
             .with_context(|| format!("Failed to load reference codes: {}", path.display()))
+    }
+
+    /// Load pre-encoded NeuCodec reference codes from raw `.npy` bytes.
+    ///
+    /// Useful when the file is embedded in the binary with `include_bytes!`
+    /// rather than read from disk at runtime.
+    pub fn load_ref_codes_from_bytes(&self, bytes: &[u8]) -> Result<Vec<i32>> {
+        npy::parse_npy(bytes)
+            .context("Failed to parse embedded NPY reference codes")?
+            .into_i32()
+            .context("Failed to convert embedded NPY to i32")
     }
 
     /// Encode a reference WAV file to NeuCodec token IDs.

@@ -44,8 +44,9 @@ pub const ENCODER_SAMPLES_PER_TOKEN: usize = 320;
 /// Default reference audio length for the encoder: 10 s × 16 000 Hz.
 pub const ENCODER_DEFAULT_INPUT_SAMPLES: usize = 16_000 * 10;
 
-/// True when the `wgpu` Cargo feature is enabled (reserved for future GPU
-/// acceleration — codec currently always runs on CPU).
+/// True when the `wgpu` Cargo feature is enabled.
+/// When enabled, `NeuCodecDecoder` uses the Burn wgpu backend (GPU) with
+/// automatic fallback to Burn NdArray (CPU) and then raw ndarray.
 pub fn wgpu_feature_enabled() -> bool {
     cfg!(feature = "wgpu")
 }
@@ -53,11 +54,11 @@ pub fn wgpu_feature_enabled() -> bool {
 // ─── FSQ constants ────────────────────────────────────────────────────────────
 
 /// FSQ levels for NeuCodec: 8 dimensions × 4 levels → 4^8 = 65 536 codes.
-const FSQ_LEVELS: [i32; 8] = [4, 4, 4, 4, 4, 4, 4, 4];
+pub(crate) const FSQ_LEVELS: [i32; 8] = [4, 4, 4, 4, 4, 4, 4, 4];
 
 /// Cumulative products of FSQ_LEVELS: used to decompose an integer code.
 /// basis[j] = product(FSQ_LEVELS[0..j])
-const FSQ_BASIS: [i32; 8] = [1, 4, 16, 64, 256, 1_024, 4_096, 16_384];
+pub(crate) const FSQ_BASIS: [i32; 8] = [1, 4, 16, 64, 256, 1_024, 4_096, 16_384];
 
 // ─── Tensor helpers ───────────────────────────────────────────────────────────
 
@@ -310,13 +311,13 @@ fn apply_rope(x: &mut Array3<f32>) {
 
 // ─── Transformer components ───────────────────────────────────────────────────
 
-struct TransformerWeights {
-    att_norm_w: Array1<f32>,  // RMSNorm  [D]
-    c_attn_w: Array2<f32>,    // Linear   [3D, D]  (no bias)
-    c_proj_w: Array2<f32>,    // Linear   [D, D]   (no bias)
-    ffn_norm_w: Array1<f32>,  // RMSNorm  [D]
-    fc1_w: Array2<f32>,       // Linear   [4D, D]  (no bias)
-    fc2_w: Array2<f32>,       // Linear   [D, 4D]  (no bias)
+pub(crate) struct TransformerWeights {
+    pub(crate) att_norm_w: Array1<f32>,  // RMSNorm  [D]
+    pub(crate) c_attn_w: Array2<f32>,    // Linear   [3D, D]  (no bias)
+    pub(crate) c_proj_w: Array2<f32>,    // Linear   [D, D]   (no bias)
+    pub(crate) ffn_norm_w: Array1<f32>,  // RMSNorm  [D]
+    pub(crate) fc1_w: Array2<f32>,       // Linear   [4D, D]  (no bias)
+    pub(crate) fc2_w: Array2<f32>,       // Linear   [D, 4D]  (no bias)
 }
 
 /// Single Transformer block (RMSNorm → Attention → RMSNorm → MLP), residual.
@@ -396,15 +397,15 @@ fn transformer_block(x: ArrayView2<f32>, w: &TransformerWeights, n_heads: usize)
 
 // ─── ResnetBlock ─────────────────────────────────────────────────────────────
 
-struct ResnetBlockWeights {
-    norm1_w: Array1<f32>, // GroupNorm [C]
-    norm1_b: Array1<f32>,
-    conv1_w: Array3<f32>, // Conv1d [C, C, 3]
-    conv1_b: Array1<f32>,
-    norm2_w: Array1<f32>,
-    norm2_b: Array1<f32>,
-    conv2_w: Array3<f32>, // Conv1d [C, C, 3]
-    conv2_b: Array1<f32>,
+pub(crate) struct ResnetBlockWeights {
+    pub(crate) norm1_w: Array1<f32>, // GroupNorm [C]
+    pub(crate) norm1_b: Array1<f32>,
+    pub(crate) conv1_w: Array3<f32>, // Conv1d [C, C, 3]
+    pub(crate) conv1_b: Array1<f32>,
+    pub(crate) norm2_w: Array1<f32>,
+    pub(crate) norm2_b: Array1<f32>,
+    pub(crate) conv2_w: Array3<f32>, // Conv1d [C, C, 3]
+    pub(crate) conv2_b: Array1<f32>,
 }
 
 /// ResnetBlock: GroupNorm → swish → Conv1d(k=3) → GroupNorm → swish → Conv1d(k=3) + residual.
@@ -434,7 +435,10 @@ fn resnet_block(x: ArrayView2<f32>, w: &ResnetBlockWeights) -> Array2<f32> {
 /// * `hop`: hop length (= n_fft / 4)
 /// * `window`: Hann window \[n_fft\]
 /// * returns: waveform \[T × hop\]
-fn istft(
+///
+/// `pub(crate)` so the Burn decoder in `codec_burn.rs` can call it after
+/// pulling the head output back from the device.
+pub(crate) fn istft_burn(
     mag: ArrayView2<f32>,
     phase: ArrayView2<f32>,
     hop: usize,
@@ -503,44 +507,44 @@ fn hann_window(n: usize) -> Vec<f32> {
 
 // ─── Decoder weights ──────────────────────────────────────────────────────────
 
-struct DecoderWeights {
+pub(crate) struct DecoderWeights {
     // FSQ
-    fsq_proj_w: Array2<f32>, // [2048, 8]
-    fsq_proj_b: Array1<f32>, // [2048]
+    pub(crate) fsq_proj_w: Array2<f32>, // [2048, 8]
+    pub(crate) fsq_proj_b: Array1<f32>, // [2048]
 
     // fc_post_a: Linear(2048, 1024)
-    fc_post_a_w: Array2<f32>, // [1024, 2048]
-    fc_post_a_b: Array1<f32>, // [1024]
+    pub(crate) fc_post_a_w: Array2<f32>, // [1024, 2048]
+    pub(crate) fc_post_a_b: Array1<f32>, // [1024]
 
     // backbone.embed: Conv1d(1024, 1024, k=7, pad=3)
-    embed_w: Array3<f32>, // [1024, 1024, 7]
-    embed_b: Array1<f32>, // [1024]
+    pub(crate) embed_w: Array3<f32>, // [1024, 1024, 7]
+    pub(crate) embed_b: Array1<f32>, // [1024]
 
     // backbone.prior_net (2 ResnetBlocks)
-    prior_net: Vec<ResnetBlockWeights>,
+    pub(crate) prior_net: Vec<ResnetBlockWeights>,
 
     // backbone.transformers (N TransformerBlocks)
-    transformers: Vec<TransformerWeights>,
+    pub(crate) transformers: Vec<TransformerWeights>,
 
     // backbone.final_layer_norm: LayerNorm [D]
-    final_norm_w: Array1<f32>,
-    final_norm_b: Array1<f32>,
+    pub(crate) final_norm_w: Array1<f32>,
+    pub(crate) final_norm_b: Array1<f32>,
 
     // backbone.post_net (2 ResnetBlocks)
-    post_net: Vec<ResnetBlockWeights>,
+    pub(crate) post_net: Vec<ResnetBlockWeights>,
 
     // head.out: Linear(D, n_fft+2)
-    head_w: Array2<f32>, // [n_fft+2, 1024]
-    head_b: Array1<f32>, // [n_fft+2]
+    pub(crate) head_w: Array2<f32>, // [n_fft+2, 1024]
+    pub(crate) head_b: Array1<f32>, // [n_fft+2]
 
     // Hann window
-    window: Vec<f32>, // [n_fft]
+    pub(crate) window: Vec<f32>, // [n_fft]
 
     // Detected hyper-parameters
-    hidden_dim: usize,
-    hop_length: usize,
-    depth: usize,
-    n_heads: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) hop_length: usize,
+    pub(crate) depth: usize,
+    pub(crate) n_heads: usize,
 }
 
 fn load_resnet_block(st: &SafeTensors<'_>, prefix: &str, c: usize) -> Result<ResnetBlockWeights> {
@@ -791,7 +795,7 @@ fn decode_forward(codes: &[i32], w: &DecoderWeights) -> Vec<f32> {
     let phase = x_pred_ct.slice(s![half.., ..]).to_owned();
 
     // 10. ISTFT
-    istft(mag.view(), phase.view(), hop, &w.window)
+    istft_burn(mag.view(), phase.view(), hop, &w.window)
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -814,9 +818,25 @@ fn default_decoder_path() -> PathBuf {
 /// let dec = NeuCodecDecoder::new()?;
 /// let audio = dec.decode(&codes)?;
 /// ```
+///
+/// ## Backend selection
+///
+/// When built with `--features wgpu`, the decoder automatically selects the
+/// best available backend at load time:
+///
+/// | Priority | Backend                   | When used                          |
+/// |----------|---------------------------|------------------------------------|
+/// | 1        | Burn wgpu (GPU)           | Metal / Vulkan / DX12 adapter found|
+/// | 2        | Burn NdArray (CPU)        | No GPU adapter available           |
+/// | 3        | Raw ndarray (CPU)         | Burn init failed entirely          |
 pub struct NeuCodecDecoder {
     weights: DecoderWeights,
-    path: PathBuf,
+    path:    PathBuf,
+
+    /// Burn-accelerated decoder; `Some` when `wgpu` feature is enabled and
+    /// at least one Burn backend initialised successfully.
+    #[cfg(feature = "wgpu")]
+    burn_decoder: Option<Box<dyn crate::codec_burn::BurnDecoder + Send>>,
 }
 
 impl NeuCodecDecoder {
@@ -864,9 +884,15 @@ impl NeuCodecDecoder {
             SAMPLE_RATE as usize / weights.hop_length,
         );
 
+        // Build the Burn decoder (wgpu GPU → NdArray CPU → raw ndarray fallback).
+        #[cfg(feature = "wgpu")]
+        let burn_decoder = crate::codec_burn::make_burn_decoder(&weights);
+
         Ok(Self {
             weights,
             path: path.to_path_buf(),
+            #[cfg(feature = "wgpu")]
+            burn_decoder,
         })
     }
 
@@ -878,11 +904,29 @@ impl NeuCodecDecoder {
         if codes.is_empty() {
             return Ok(Vec::new());
         }
+
+        // ── Prefer Burn-accelerated path (wgpu GPU or NdArray CPU via Burn) ──
+        #[cfg(feature = "wgpu")]
+        if let Some(bd) = &self.burn_decoder {
+            return bd.decode(codes);
+        }
+
+        // ── Fallback: raw ndarray CPU decoder ─────────────────────────────────
         Ok(decode_forward(codes, &self.weights))
     }
 
-    /// Name of the active inference backend (always `"cpu"` for this build).
+    /// Name of the active inference backend.
+    ///
+    /// | Return value            | Condition                                  |
+    /// |-------------------------|--------------------------------------------|
+    /// | `"burn/wgpu (GPU)"`     | `wgpu` feature + GPU adapter found         |
+    /// | `"burn/ndarray (CPU)"`  | `wgpu` feature + no GPU (Burn NdArray)     |
+    /// | `"cpu (ndarray)"`       | raw ndarray fallback (no `wgpu` feature)   |
     pub fn backend_name(&self) -> &str {
+        #[cfg(feature = "wgpu")]
+        if let Some(bd) = &self.burn_decoder {
+            return bd.backend_name();
+        }
         "cpu (ndarray)"
     }
 
@@ -1104,7 +1148,7 @@ mod tests {
         let mag = Array2::zeros((n_bins, t));
         let phase = Array2::zeros((n_bins, t));
         let win = hann_window(n_fft);
-        let audio = istft(mag.view(), phase.view(), hop, &win);
+        let audio = istft_burn(mag.view(), phase.view(), hop, &win);
         // Expected: t * hop samples
         assert_eq!(audio.len(), t * hop, "expected {} samples, got {}", t * hop, audio.len());
     }

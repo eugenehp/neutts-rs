@@ -18,17 +18,20 @@ exclude = ["ios", "android"]
 #
 # espeak   — links libespeak-ng; enables raw-text input (text → IPA → model).
 #
-# wgpu     — reserved for future GPU acceleration (currently a no-op).
-#            NeuCodec inference runs on CPU (ndarray) by default.
+# wgpu     — Burn wgpu GPU backend for NeuCodec decoder.
+#            Tries wgpu (Metal/Vulkan/DX12) → Burn NdArray CPU → raw ndarray.
 #
 # metal / cuda — GPU acceleration for the backbone only (passed to llama-cpp-2).
 [features]
 default  = ["backbone"]
 backbone = ["dep:llama-cpp-2"]
 espeak   = []
-wgpu     = []          # reserved — no-op until Burn/wgpu codec is wired up
+wgpu     = ["dep:burn"]  # GPU-accelerated NeuCodec decoder via Burn wgpu backend
 metal    = ["llama-cpp-2?/metal"]
 cuda     = ["llama-cpp-2?/cuda"]
+# verbose — when absent, llama.cpp / ggml log output is silenced at runtime.
+# Pass `--features verbose` to cargo build/run to restore the raw log stream.
+verbose  = []
 
 [lib]
 crate-type = ["staticlib", "rlib"]
@@ -76,7 +79,20 @@ safetensors = "0.5"
 rustfft = "6"
 ndarray = "0.16"
 
-# GGUF backbone — optional
+# ── Burn — GPU/CPU codec acceleration (optional, enabled by `wgpu` feature) ──
+#
+# The `wgpu` feature flag activates burn with both the wgpu (GPU) and ndarray
+# (CPU fallback) backends.  At runtime the decoder tries the wgpu backend
+# first; if no compatible GPU adapter is found it silently falls back to the
+# Burn NdArray CPU backend.  If Burn itself fails to initialise, the existing
+# pure-ndarray CPU decoder is used as a last resort.
+[dependencies.burn]
+version  = "0.20"
+optional = true
+default-features = false
+features = ["std", "wgpu", "ndarray"]
+
+# ── GGUF backbone — optional ─────────────────────────────────────────────────
 [dependencies.llama-cpp-2]
 version = "0.1"
 optional = true
