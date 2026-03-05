@@ -916,21 +916,20 @@ fn default_decoder_path() -> PathBuf {
 /// | 2        | Burn NdArray (CPU)        | No GPU adapter available           |
 /// | 3        | Raw ndarray (CPU)         | Burn init failed entirely          |
 ///
-/// The Burn backend is initialised **lazily** on the first call to [`decode`]
-/// so that model loading is fast regardless of GPU upload time.
+/// The Burn backend is initialised **eagerly** at [`from_file`](Self::from_file)
+/// time so the GPU upload cost is part of model loading, not synthesis latency.
 pub struct NeuCodecDecoder {
     weights: DecoderWeights,
     path:    PathBuf,
 
-    /// Lazily-initialised Burn backend.
+    /// Eagerly-initialised Burn backend.
     ///
-    /// * `Pending`        — not yet initialised (GPU upload deferred).
     /// * `Ready(Some(_))` — Burn backend available and ready.
-    /// * `Ready(None)`    — Burn init was attempted but failed; fall through
+    /// * `Ready(None)`    — Burn init was attempted but failed; falls through
     ///                      to raw ndarray.
     ///
     /// The `Mutex` provides interior mutability so that `decode(&self)` can
-    /// initialise the backend on first use without requiring `&mut self`.
+    /// be called without `&mut self`.
     /// `Mutex<T>: Send + Sync` when `T: Send`, so `NeuCodecDecoder` remains
     /// `Send + Sync`.
     #[cfg(feature = "wgpu")]
@@ -939,9 +938,7 @@ pub struct NeuCodecDecoder {
 
 #[cfg(feature = "wgpu")]
 enum LazyBurnDecoder {
-    /// GPU upload not yet performed.
-    Pending,
-    /// Initialised; `None` means no Burn backend is available.
+    /// Burn backend is available and ready.
     Ready(Option<Box<dyn crate::codec_burn::BurnDecoder + Send>>),
 }
 
@@ -1006,13 +1003,30 @@ impl NeuCodecDecoder {
             SAMPLE_RATE as usize / weights.hop_length,
         );
 
+        // ── Eagerly initialise the Burn GPU/CPU backend ───────────────────────
+        //
+        // Initialising here (at load time) rather than lazily on the first
+        // decode() call moves the ~1-2 s GPU upload cost out of synthesis
+        // latency and into model loading, which is a better user experience:
+        // the "loaded in X s" number is honest, and "synth took Y s" reflects
+        // only the actual forward pass.
+        #[cfg(feature = "wgpu")]
+        let burn_decoder = {
+            let t0 = std::time::Instant::now();
+            let dec = crate::codec_burn::make_burn_decoder(&weights);
+            println!(
+                "NeuCodec: {} backend ready in {:.2} s",
+                dec.as_ref().map_or("cpu (ndarray)", |b| b.backend_name()),
+                t0.elapsed().as_secs_f32(),
+            );
+            std::sync::Mutex::new(LazyBurnDecoder::Ready(dec))
+        };
+
         Ok(Self {
             weights,
             path: path.to_path_buf(),
-            // Burn backend is initialised lazily on the first decode() call so
-            // that model loading completes immediately without a GPU upload.
             #[cfg(feature = "wgpu")]
-            burn_decoder: std::sync::Mutex::new(LazyBurnDecoder::Pending),
+            burn_decoder,
         })
     }
 
@@ -1039,20 +1053,12 @@ impl NeuCodecDecoder {
         }
 
         // ── Prefer Burn-accelerated path (wgpu GPU or NdArray CPU via Burn) ──
+        //
+        // The backend is always Ready here: it is initialised eagerly in
+        // from_file() so there is no lazy-init stall inside synthesis.
         #[cfg(feature = "wgpu")]
         {
-            let mut state = self.burn_decoder.lock().unwrap();
-            // Lazy init: upload weights to the GPU on first decode call.
-            if let LazyBurnDecoder::Pending = *state {
-                println!("NeuCodec: initialising GPU backend (first call)…");
-                let t0 = std::time::Instant::now();
-                let dec = crate::codec_burn::make_burn_decoder(&self.weights);
-                println!(
-                    "NeuCodec: GPU backend ready in {:.2} s",
-                    t0.elapsed().as_secs_f32()
-                );
-                *state = LazyBurnDecoder::Ready(dec);
-            }
+            let state = self.burn_decoder.lock().unwrap();
             if let LazyBurnDecoder::Ready(Some(ref bd)) = *state {
                 return bd.decode(codes);
             }
@@ -1074,9 +1080,8 @@ impl NeuCodecDecoder {
         {
             let state = self.burn_decoder.lock().unwrap();
             return match &*state {
-                LazyBurnDecoder::Pending          => "burn/wgpu (pending — lazy init)",
-                LazyBurnDecoder::Ready(Some(bd))  => bd.backend_name(),
-                LazyBurnDecoder::Ready(None)      => "cpu (ndarray)",
+                LazyBurnDecoder::Ready(Some(bd)) => bd.backend_name(),
+                LazyBurnDecoder::Ready(None)     => "cpu (ndarray)",
             };
         }
         #[cfg(not(feature = "wgpu"))]

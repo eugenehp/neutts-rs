@@ -108,9 +108,16 @@ struct BurnWeights<B: Backend> {
     // Pre-built IFFT plan — shared from DecoderWeights so we don't re-plan
     // on every decode() call.
     ifft_plan:    std::sync::Arc<dyn rustfft::Fft<f32>>,
+    // Pre-computed RoPE tables for up to MAX_SEQ_LEN positions.
+    // Shape: [MAX_SEQ_LEN, head_dim/2].  Sliced to [T, half] at decode time
+    // so the 24 per-call CPU→GPU uploads (12 blocks × Q+K) become a single
+    // slice op on an already-resident device tensor.
+    rope_cos:     Tensor<B, 2>,
+    rope_sin:     Tensor<B, 2>,
     // Hyper-parameters
     hop_length:   usize,
     n_heads:      usize,
+    head_dim:     usize,  // hidden / n_heads
     embed_pad:    usize,
 }
 
@@ -170,6 +177,29 @@ fn load_transformer<B: Backend>(
 fn load_weights<B: Backend>(dw: &DecoderWeights, device: &B::Device) -> BurnWeights<B> {
     let embed_k   = dw.embed_w.shape()[2];
     let embed_pad = embed_k / 2;
+    let head_dim  = dw.hidden_dim / dw.n_heads;  // e.g. 1024/16 = 64
+    let half      = head_dim / 2;                // e.g. 32
+
+    // Pre-compute RoPE cos/sin tables for up to MAX_SEQ_LEN positions.
+    //
+    // In the old code t_apply_rope() rebuilt these on every call — that means
+    // 24 separate CPU→GPU uploads per decode (12 transformer blocks × Q+K).
+    // Uploading once here and slicing at decode time is essentially free.
+    const MAX_SEQ_LEN: usize = 2048;
+    let mut theta = vec![0.0f32; MAX_SEQ_LEN * half];
+    for p in 0..MAX_SEQ_LEN {
+        let p_f = p as f32;
+        for i in 0..half {
+            theta[p * half + i] =
+                p_f * (1.0_f32 / 10_000_f32.powf(2.0 * i as f32 / head_dim as f32));
+        }
+    }
+    let cos_vec: Vec<f32> = theta.iter().map(|&v| v.cos()).collect();
+    let sin_vec: Vec<f32> = theta.iter().map(|&v| v.sin()).collect();
+    let rope_cos: Tensor<B, 2> =
+        Tensor::from_data(TensorData::new(cos_vec, vec![MAX_SEQ_LEN, half]), device);
+    let rope_sin: Tensor<B, 2> =
+        Tensor::from_data(TensorData::new(sin_vec, vec![MAX_SEQ_LEN, half]), device);
 
     BurnWeights {
         fsq_proj_w:   a2_to_t2(&dw.fsq_proj_w,  device),
@@ -187,8 +217,11 @@ fn load_weights<B: Backend>(dw: &DecoderWeights, device: &B::Device) -> BurnWeig
         head_b:       a1_to_t1(&dw.head_b, device),
         window:       dw.window.clone(),
         ifft_plan:    std::sync::Arc::clone(&dw.ifft_plan),
+        rope_cos,
+        rope_sin,
         hop_length:   dw.hop_length,
         n_heads:      dw.n_heads,
+        head_dim,
         embed_pad,
     }
 }
@@ -287,40 +320,26 @@ fn t_rms_norm<B: Backend>(x: Tensor<B, 2>, w: &Tensor<B, 1>, eps: f32) -> Tensor
     xn * w2
 }
 
-/// Apply split-half RoPE in-place to `x: [T, n_heads, head_dim]`.
+/// Apply split-half RoPE to `x: [T, n_heads, head_dim]`.
 ///
-/// Frequencies and cos/sin tables are built on-device from position indices.
-fn t_apply_rope<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {
+/// `cos2` and `sin2` are pre-sliced from `BurnWeights::rope_cos/sin` to
+/// shape `[T, head_dim/2]`.  Passing them in avoids the per-call CPU computation
+/// and GPU upload that the old self-contained version performed.
+fn t_apply_rope<B: Backend>(
+    x:    Tensor<B, 3>,
+    cos2: &Tensor<B, 2>,  // [T, head_dim/2]
+    sin2: &Tensor<B, 2>,  // [T, head_dim/2]
+) -> Tensor<B, 3> {
     let [t, n_heads, head_dim] = x.dims();
     let half = head_dim / 2;
-    let device = x.device();
-
-    // Build frequency table: [half]
-    let freqs: Vec<f32> = (0..half)
-        .map(|i| 1.0_f32 / 10_000_f32.powf(2.0 * i as f32 / head_dim as f32))
-        .collect();
-
-    // Theta: [T, half]  (outer product of positions × freqs)
-    let mut theta = vec![0.0f32; t * half];
-    for p in 0..t {
-        for i in 0..half {
-            theta[p * half + i] = p as f32 * freqs[i];
-        }
-    }
-
-    let cos_data = TensorData::new(theta.iter().map(|v| v.cos()).collect::<Vec<_>>(), vec![t, half]);
-    let sin_data = TensorData::new(theta.iter().map(|v| v.sin()).collect::<Vec<_>>(), vec![t, half]);
-
-    let cos2: Tensor<B, 2> = Tensor::from_data(cos_data, &device);  // [T, half]
-    let sin2: Tensor<B, 2> = Tensor::from_data(sin_data, &device);  // [T, half]
 
     // Expand to [T, 1, half] for broadcasting over n_heads
-    let cos3 = cos2.unsqueeze_dim::<3>(1);  // [T, 1, half]
-    let sin3 = sin2.unsqueeze_dim::<3>(1);  // [T, 1, half]
+    let cos3 = cos2.clone().unsqueeze_dim::<3>(1);  // [T, 1, half]
+    let sin3 = sin2.clone().unsqueeze_dim::<3>(1);  // [T, 1, half]
 
     // Split x into first / second halves along head_dim
-    let x1 = x.clone().slice([0..t, 0..n_heads, 0..half]);      // [T, n_heads, half]
-    let x2 = x.clone().slice([0..t, 0..n_heads, half..head_dim]); // [T, n_heads, half]
+    let x1 = x.clone().slice([0..t, 0..n_heads, 0..half]);        // [T, n_heads, half]
+    let x2 = x        .slice([0..t, 0..n_heads, half..head_dim]);  // [T, n_heads, half]
 
     // Rotated halves
     let rx1 = x1.clone() * cos3.clone() - x2.clone() * sin3.clone();
@@ -347,9 +366,11 @@ fn t_resnet_block<B: Backend>(x: Tensor<B, 2>, rw: &BurnResnetBlock<B>) -> Tenso
 }
 
 fn t_transformer_block<B: Backend>(
-    x:       Tensor<B, 2>,
-    tw:      &BurnTransformer<B>,
-    n_heads: usize,
+    x:        Tensor<B, 2>,
+    tw:       &BurnTransformer<B>,
+    n_heads:  usize,
+    rope_cos: &Tensor<B, 2>,  // [T, head_dim/2] — pre-sliced for this sequence length
+    rope_sin: &Tensor<B, 2>,  // [T, head_dim/2]
 ) -> Tensor<B, 2> {
     let [t, d] = x.dims();
     let head_dim = d / n_heads;
@@ -364,9 +385,9 @@ fn t_transformer_block<B: Backend>(
     let k_flat = qkv.clone().slice([0..t, d..2 * d]);
     let v_flat = qkv        .slice([0..t, 2 * d..3 * d]);
 
-    // [T, D] → [T, n_heads, head_dim]
-    let q = t_apply_rope(q_flat.reshape([t, n_heads, head_dim]));
-    let k = t_apply_rope(k_flat.reshape([t, n_heads, head_dim]));
+    // [T, D] → [T, n_heads, head_dim], apply RoPE using pre-sliced tables
+    let q = t_apply_rope(q_flat.reshape([t, n_heads, head_dim]), rope_cos, rope_sin);
+    let k = t_apply_rope(k_flat.reshape([t, n_heads, head_dim]), rope_cos, rope_sin);
     let v = v_flat.reshape([t, n_heads, head_dim]);
 
     // Batched attention: permute to [n_heads, T, head_dim]
@@ -428,6 +449,14 @@ fn t_fsq_decode<B: Backend>(
 fn burn_decode<B: Backend>(codes: &[i32], w: &BurnWeights<B>) -> Vec<f32> {
     let hop   = w.hop_length;
     let n_fft = hop * 4;
+    let t     = codes.len();
+    let half  = w.head_dim / 2;
+
+    // Slice the pre-computed RoPE tables down to the actual sequence length.
+    // This single slice (O(1) view op) replaces the 24 per-decode CPU→GPU
+    // uploads that t_apply_rope() used to perform (12 blocks × Q + K).
+    let rope_cos = w.rope_cos.clone().slice([0..t, 0..half]);  // [T, half]
+    let rope_sin = w.rope_sin.clone().slice([0..t, 0..half]);  // [T, half]
 
     // 1. FSQ decode: [T, 8] → [T, fsq_out]
     let emb = t_fsq_decode(codes, &w.fsq_proj_w, &w.fsq_proj_b);
@@ -442,9 +471,11 @@ fn burn_decode<B: Backend>(codes: &[i32], w: &BurnWeights<B>) -> Vec<f32> {
     let x_ct = w.prior_net.iter().fold(x_ct, |acc, rw| t_resnet_block(acc, rw));
 
     // 5. Transformers (sequence-first [T, hidden])
+    //    rope_cos/sin are passed by reference; each t_apply_rope call clones
+    //    the cheap Arc-backed tensor handle rather than re-uploading data.
     let x_tc = w.transformers.iter().fold(
         x_ct.transpose(),
-        |acc, tw| t_transformer_block(acc, tw, w.n_heads),
+        |acc, tw| t_transformer_block(acc, tw, w.n_heads, &rope_cos, &rope_sin),
     );
 
     // 6. post_net (channels-first)
@@ -457,22 +488,22 @@ fn burn_decode<B: Backend>(codes: &[i32], w: &BurnWeights<B>) -> Vec<f32> {
     let x_pred = t_linear(x_tc, &w.head_w, Some(&w.head_b));
 
     // 9. Pull to CPU: x_pred is row-major [T, n_fft+2]
-    let [t, n_out] = x_pred.dims();
+    let [_n_frames, n_out] = x_pred.dims();
     let flat: Vec<f32> = x_pred.into_data().into_vec::<f32>().expect("tensor data read");
 
-    // 10. Rearrange to [half, T] for mag and phase (matching CPU codec layout)
-    let half = n_fft / 2 + 1;
-    let mut mag   = vec![0.0f32; half * t];
-    let mut phase = vec![0.0f32; half * t];
+    // 10. Rearrange to [n_bins, T] for mag and phase (matching CPU codec layout)
+    let n_bins = n_fft / 2 + 1;
+    let mut mag   = vec![0.0f32; n_bins * t];
+    let mut phase = vec![0.0f32; n_bins * t];
     for ti in 0..t {
-        for fi in 0..half {
+        for fi in 0..n_bins {
             mag  [fi * t + ti] = flat[ti * n_out + fi];
-            phase[fi * t + ti] = flat[ti * n_out + half + fi];
+            phase[fi * t + ti] = flat[ti * n_out + n_bins + fi];
         }
     }
 
-    let mag_a   = ndarray::Array2::from_shape_vec((half, t), mag)  .expect("mag shape");
-    let phase_a = ndarray::Array2::from_shape_vec((half, t), phase).expect("phase shape");
+    let mag_a   = ndarray::Array2::from_shape_vec((n_bins, t), mag)  .expect("mag shape");
+    let phase_a = ndarray::Array2::from_shape_vec((n_bins, t), phase).expect("phase shape");
 
     // 11. ISTFT (CPU, rustfft) — use the pre-built plan stored in DecoderWeights
     istft_burn(mag_a.view(), phase_a.view(), hop, &w.window, w.ifft_plan.as_ref())
