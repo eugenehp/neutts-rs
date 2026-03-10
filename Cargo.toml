@@ -1,6 +1,6 @@
 [package]
 name = "neutts"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 authors = ["Eugene Hauptmann"]
 description = "Rust port of NeuTTS — on-device voice-cloning TTS with GGUF backbone and NeuCodec decoder"

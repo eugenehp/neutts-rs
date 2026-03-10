@@ -177,6 +177,7 @@ pub fn find_model(repo: &str) -> Option<&'static ModelInfo> {
 
 /// espeak-ng language code for a backbone repo.
 /// Falls back to `"en-us"` for unknown repos.
+#[cfg(feature = "backbone")]
 fn backbone_language(repo: &str) -> &'static str {
     find_model(repo).map(|m| m.language).unwrap_or("en-us")
 }
@@ -375,6 +376,7 @@ pub fn convert_neucodec_checkpoint(
     convert_checkpoint_inner(bin_path, out_path, n_heads, repo)
 }
 
+#[cfg(feature = "backbone")]
 fn convert_checkpoint(bin_path: &std::path::Path, out_path: &std::path::Path) -> Result<()> {
     convert_checkpoint_inner(bin_path, out_path, 16, CODEC_DECODER_REPO)
 }

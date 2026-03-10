@@ -57,7 +57,7 @@
 //!   `--ref-codes` and is compatible with `np.load()` in Python.
 //! - Aim for 5–30 seconds of clean, noise-free speech for best results.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
     // ── Parse CLI arguments ───────────────────────────────────────────────────

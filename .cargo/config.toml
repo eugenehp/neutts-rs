@@ -25,3 +25,28 @@
 [env]
 MACOSX_DEPLOYMENT_TARGET    = { value = "13.4", force = true }
 CMAKE_OSX_DEPLOYMENT_TARGET = { value = "13.4", force = true }
+
+# ── Cross-compilation: Windows x86_64 GNU via Zig ─────────────────────────────
+#
+# Zig ships a built-in C/C++ compiler that can target any LLVM-supported triple,
+# making it ideal for cross-compiling Rust crates that include C dependencies.
+#
+# `zig cc -target x86_64-windows-gnu` acts as:
+#   - a drop-in ANSI C89 compiler  (cc / clang compatible)
+#   - a PE/COFF linker             (produces valid .dll / .exe / .lib)
+#
+# Usage:
+#   cargo build --target x86_64-pc-windows-gnu --no-default-features --features fast
+#
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar     = "x86_64-w64-mingw32-ar"
+
+# ── Cross-compilation: Linux x86_64 musl (from aarch64) ───────────────────────
+#
+# Used to produce a statically-linked Linux x86_64 binary without a glibc
+# dependency.  Zig handles the cross-compilation automatically.
+#
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+ar     = "x86_64-linux-musl-ar"

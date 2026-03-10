@@ -1,5 +1,7 @@
 # neutts-rs
 
+[![Version](https://img.shields.io/badge/version-0.0.6-blue)](CHANGELOG.md)
+
 Rust port of [NeuTTS](https://github.com/neuphonic/neutts) — on-device voice-cloning TTS
 built on a GGUF LLM backbone and the [NeuCodec](https://huggingface.co/neuphonic/neucodec)
 neural audio codec.
@@ -370,10 +372,85 @@ Measured on a MacBook Pro M2 with the `wgpu` feature (Metal GPU) and
 
 ## Build requirements
 
-| Platform | Backbone | Codec | Phonemizer |
-|----------|----------|-------|------------|
-| Linux / macOS | cmake + C++ (auto) | pure Rust | `libespeak-ng-dev` / `brew install espeak-ng` |
-| iOS / Android | cross-compile llama.cpp | pure Rust | cross-compile espeak-ng; set `ESPEAK_LIB_DIR` |
+| Platform | Backbone | Codec | Phonemizer (`espeak` feature) |
+|----------|----------|-------|-------------------------------|
+| macOS | cmake + C++ (auto) | pure Rust | `brew install espeak-ng` — or `bash scripts/build-espeak.sh` |
+| Linux | cmake + C++ (auto) | pure Rust | `apt install libespeak-ng-dev` — or `bash scripts/build-espeak.sh` |
+| Windows MSVC | cmake + MSVC (auto) | pure Rust | `.\scripts\build-espeak-windows.ps1` (see below) |
+| Windows GNU | cmake + MinGW (auto) | pure Rust | `bash scripts/build-espeak.sh` (WSL or Git Bash) |
+| iOS / Android | cross-compile llama.cpp | pure Rust | Cross-compile espeak-ng; set `ESPEAK_LIB_DIR` |
+
+### Windows (MSVC) — quick start
+
+```powershell
+# Prerequisites (one-time):
+winget install Kitware.CMake Git.Git LLVM.LLVM Ninja-build.Ninja
+
+# From a "Developer PowerShell for VS 2022":
+.\scripts\build-espeak-windows.ps1
+
+# Build:
+$env:ESPEAK_LIB_DIR = "espeak-static\lib"
+cargo build --features espeak
+```
+
+The PowerShell script builds espeak-ng from source into `espeak-static\lib\espeak-ng-merged.lib`
+and copies the language data to `espeak-static\share\espeak-ng-data\`.
+
+**Path-length note:** if your project tree is deeply nested, pass `-BuildRoot C:\es` to use a
+short build directory and avoid Windows MAX\_PATH issues:
+
+```powershell
+.\scripts\build-espeak-windows.ps1 -BuildRoot C:\es
+```
+
+Alternatively, set `ESPEAK_BUILD_DIR=C:\es` before `cargo build` and the build script will use
+that directory automatically.
+
+### Cross-compiling Linux/macOS → Windows x86\_64-pc-windows-gnu
+
+**Option A — MinGW-w64** (Ubuntu / Debian / macOS):
+
+```bash
+# Install MinGW-w64 cross-compiler:
+#   Ubuntu:  sudo apt install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+#   macOS:   brew install mingw-w64
+
+# Build espeak-ng for Windows-GNU target:
+CROSS_TARGET=x86_64-w64-mingw32 bash scripts/build-espeak.sh
+
+# Add the Rust target and build:
+rustup target add x86_64-pc-windows-gnu
+ESPEAK_LIB_DIR=espeak-static/lib \
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+cargo build --target x86_64-pc-windows-gnu --features espeak
+```
+
+**Option B — Zig as cross-compiler** (Alpine Linux / any host with Zig):
+
+When MinGW-w64 is unavailable (e.g. Alpine Linux), Zig ships a built-in
+`x86_64-windows-gnu` cross-compiler that can substitute:
+
+```bash
+# Install Zig (0.12+)
+# Alpine: apk add zig
+# Others: https://ziglang.org/download/
+
+# Create thin wrapper scripts so cc-rs can find the MinGW triple:
+cat > /usr/local/bin/x86_64-w64-mingw32-gcc << 'EOF'
+#!/bin/sh
+args=$(printf '%s\n' "$@" | grep -v -- '--target=x86_64-pc-windows-gnu')
+exec zig cc -target x86_64-windows-gnu $args
+EOF
+chmod +x /usr/local/bin/x86_64-w64-mingw32-gcc
+
+# Codec-only build (no espeak / cmake required):
+rustup target add x86_64-pc-windows-gnu
+cargo build --target x86_64-pc-windows-gnu --no-default-features --features fast --release
+# → target/x86_64-pc-windows-gnu/release/libneutts.a  (PE/COFF x86-64)
+```
+
+See `.cargo/config.toml` for the pre-wired linker/ar configuration.
 
 ---
 
@@ -545,6 +622,8 @@ See [`include/neutts.h`](include/neutts.h) for the full C header.
 | Streaming PCM output (`stream_pcm` example) | ✅ |
 | English backbones (Nano / Air, Q4 / Q8) | ✅ |
 | German / French / Spanish backbones | ✅ |
+| Windows cross-compilation (Zig or MinGW-w64) | ✅ |
+| Test suite (unit + integration + e2e) | ✅ 106 tests, no model files required |
 | iOS / Android build | ✅ codec is pure Rust; backbone needs cross-compile |
 
 ---
@@ -559,7 +638,7 @@ If you use this software in your research or project, please cite it as:
   title        = {{neutts}: Rust port of {NeuTTS} — on-device voice-cloning {TTS}
                   with {GGUF} backbone and {NeuCodec} decoder},
   year         = {2026},
-  version      = {0.0.2},
+  version      = {0.0.6},
   license      = {MIT},
   url          = {https://github.com/eugenehp/neutts-rs}
 }

@@ -2,182 +2,246 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # scripts/build-espeak.sh
 #
-# Download, build, and install a static libespeak-ng into
-#   <crate-root>/espeak-static/install/
+# Build a static libespeak-ng and cache it under
+#   <crate-root>/espeak-static/lib/
 #
-# This script produces the exact same layout that build.rs's auto-build
-# (step 4) produces, so you can pre-run it manually and the build script will
-# pick up the cached result without downloading again.
+# Supported targets:
+#   • macOS arm64 / x86_64    (native; merges with libtool -static)
+#   • Linux x86_64 / aarch64  (native; merges with ar MRI script)
+#   • Windows x86_64-gnu      (cross-compile from Linux/macOS with MinGW-w64;
+#                               set CROSS_TARGET=x86_64-w64-mingw32)
 #
-# Usage:
+# For native Windows MSVC builds use scripts\build-espeak-windows.ps1 instead.
+#
+# ── Environment variables ─────────────────────────────────────────────────────
+#   ESPEAK_VERSION    espeak-ng release tag (default: 1.52.0)
+#   BUILD_DIR         temporary build root (default: <system tmpdir>/espeak-build-$$)
+#   CROSS_TARGET      MinGW target triple for cross-compile
+#                     e.g. x86_64-w64-mingw32
+#   CMAKE_EXTRA_ARGS  extra flags passed verbatim to cmake configure
+#   JOBS              parallel build jobs (default: nproc / sysctl)
+#
+# ── Usage ─────────────────────────────────────────────────────────────────────
+#   # Native build
 #   bash scripts/build-espeak.sh
 #
-# After running, build with:
-#   cargo build --features espeak          # build.rs finds the cache automatically
+#   # Cross-compile to Windows-GNU from Linux (requires gcc-mingw-w64-x86-64)
+#   CROSS_TARGET=x86_64-w64-mingw32 bash scripts/build-espeak.sh
 #
-# Or point explicitly:
-#   ESPEAK_LIB_DIR=espeak-static/install/lib cargo build --features espeak
-#
-# Requirements:
-#   cmake  (brew install cmake  /  sudo apt install cmake)
-#   curl or wget
-#   A C++ compiler (clang on macOS, gcc/g++ on Linux)
+# After running, set ESPEAK_LIB_DIR or let build.rs find the cache:
+#   cargo build --features espeak
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-ESPEAK_VERSION="1.52.0"  # first release with cmake (1.51.x used autoconf)
+ESPEAK_VERSION="${ESPEAK_VERSION:-1.52.0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(dirname "$SCRIPT_DIR")"
-ROOT="$CRATE_ROOT/espeak-static"
-SRC_DIR="$ROOT/src"
-BUILD_DIR="$ROOT/build"
-INSTALL_DIR="$ROOT/install"
-TARBALL="$ROOT/espeak-ng-${ESPEAK_VERSION}.tar.gz"
+OUT_DIR="$CRATE_ROOT/espeak-static"
 TARBALL_URL="https://github.com/espeak-ng/espeak-ng/archive/refs/tags/${ESPEAK_VERSION}.tar.gz"
 
-# ── Detect parallelism ────────────────────────────────────────────────────────
-JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+# Temporary build tree — using a system tmpdir keeps paths short.
+TMP_ROOT="${BUILD_DIR:-$(mktemp -d -t espeak-build-XXXX 2>/dev/null || mktemp -d)}"
+SRC_DIR="$TMP_ROOT/src"
+BLD_DIR="$TMP_ROOT/bld"
+INST_DIR="$TMP_ROOT/inst"
+TARBALL="$TMP_ROOT/espeak-${ESPEAK_VERSION}.tar.gz"
 
-# ── Colour output helpers ─────────────────────────────────────────────────────
-bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
-green() { printf '\033[32m%s\033[0m\n' "$*"; }
-blue()  { printf '\033[34m%s\033[0m\n' "$*"; }
-warn()  { printf '\033[33mWARN: %s\033[0m\n' "$*" >&2; }
-die()   { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+CROSS_TARGET="${CROSS_TARGET:-}"
+CMAKE_EXTRA_ARGS="${CMAKE_EXTRA_ARGS:-}"
 
-bold "espeak-ng $ESPEAK_VERSION static build"
-blue "  install → $INSTALL_DIR"
+LIB_DIR="$OUT_DIR/lib"
+MERGED_LIB="$LIB_DIR/libespeak-ng-merged.a"
+STAMP_FILE="$LIB_DIR/libespeak-ng-merged.stamp"
 
-# ── Check prerequisites ───────────────────────────────────────────────────────
-if ! command -v cmake >/dev/null 2>&1; then
-    die "cmake not found.\n  macOS: brew install cmake\n  Ubuntu: sudo apt install cmake"
+# ── Colour helpers ─────────────────────────────────────────────────────────────
+step()  { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
+ok()    { printf '  \033[32m✓ %s\033[0m\n' "$*"; }
+warn()  { printf '  \033[33m⚠ %s\033[0m\n' "$*" >&2; }
+die()   { printf '\n\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+# ── Detect host OS ─────────────────────────────────────────────────────────────
+HOST_OS="$(uname -s)"
+
+# ── Cross-compile toolchain ────────────────────────────────────────────────────
+if [[ -n "$CROSS_TARGET" ]]; then
+    CC="${CROSS_TARGET}-gcc"
+    CXX="${CROSS_TARGET}-g++"
+    AR="${CROSS_TARGET}-ar"
+    RANLIB="${CROSS_TARGET}-ranlib"
+    RC="${CROSS_TARGET}-windres"
+    TOOLCHAIN_FILE="$SCRIPT_DIR/cmake/mingw-toolchain.cmake"
+
+    step "Cross-compilation → $CROSS_TARGET"
+    for tool in "$CC" "$CXX" "$AR"; do
+        if ! command -v "$tool" &>/dev/null; then
+            die "$tool not found.  Install MinGW-w64:
+  Ubuntu:   sudo apt install gcc-mingw-w64-x86-64
+  Fedora:   sudo dnf install mingw64-gcc-c++
+  macOS:    brew install mingw-w64"
+        fi
+        ok "$tool: $(command -v "$tool")"
+    done
+
+    MERGED_LIB="$LIB_DIR/libespeak-ng-merged.a"  # MinGW still uses .a
+    EXTRA_CMAKE=(
+        "-DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN_FILE"
+        "-DCMAKE_C_COMPILER=$CC"
+        "-DCMAKE_CXX_COMPILER=$CXX"
+        "-DCMAKE_RC_COMPILER=$RC"
+        "-DMINGW_PREFIX=${CROSS_TARGET}-"
+        "-DESPEAK_CROSS_PREFIX=${CROSS_TARGET}-"
+    )
+    # Ninja works on all hosts and avoids GNU make recursive issues.
+    if command -v ninja &>/dev/null; then
+        EXTRA_CMAKE+=("-GNinja")
+    fi
+else
+    AR="ar"
+    RANLIB="ranlib"
+    EXTRA_CMAKE=()
+    if [[ "$HOST_OS" == Darwin ]]; then
+        # Prefer Ninja on macOS too (avoids Xcode generator surprises).
+        if command -v ninja &>/dev/null; then
+            EXTRA_CMAKE+=("-GNinja")
+        fi
+    fi
 fi
-if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    die "Neither curl nor wget found. Install one to download the tarball."
-fi
 
-# ── Already done? ─────────────────────────────────────────────────────────────
-STATIC_LIB="$INSTALL_DIR/lib/libespeak-ng.a"
-STAMP="$INSTALL_DIR/lib/espeak-ng-merged.stamp"
-if [ -f "$STATIC_LIB" ] && [ -f "$STAMP" ] && grep -q "^$ESPEAK_VERSION" "$STAMP" 2>/dev/null; then
-    green "Already built and merged: $STATIC_LIB"
-    echo "Nothing to do. Delete espeak-static/ to force a rebuild."
+# ── Already built? ─────────────────────────────────────────────────────────────
+step "Checking for cached build"
+if [[ -f "$MERGED_LIB" && -f "$STAMP_FILE" ]] && \
+   grep -q "^${ESPEAK_VERSION}$" "$STAMP_FILE" 2>/dev/null; then
+    ok "Already built: $MERGED_LIB"
+    echo "  (delete espeak-static/ to force a rebuild)"
     exit 0
 fi
-# Remove stale lib so it gets re-merged cleanly.
-rm -f "$STATIC_LIB" "$STAMP"
+# Clean stale merged lib.
+rm -f "$MERGED_LIB" "$STAMP_FILE"
 
-mkdir -p "$SRC_DIR" "$BUILD_DIR" "$INSTALL_DIR"
-
-# ── Download ──────────────────────────────────────────────────────────────────
-if [ ! -f "$TARBALL" ]; then
-    blue "Downloading espeak-ng $ESPEAK_VERSION…"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL -o "$TARBALL" "$TARBALL_URL"
-    else
-        wget -q -O "$TARBALL" "$TARBALL_URL"
+# ── Prerequisites ──────────────────────────────────────────────────────────────
+step "Checking prerequisites"
+for tool in cmake git; do
+    if ! command -v "$tool" &>/dev/null; then
+        die "$tool not found.  macOS: brew install $tool  |  Ubuntu: sudo apt install $tool"
     fi
-    green "  downloaded → $TARBALL"
+    ok "$tool: $(command -v "$tool")"
+done
+
+# ── Create directories ─────────────────────────────────────────────────────────
+mkdir -p "$SRC_DIR" "$BLD_DIR" "$INST_DIR" "$LIB_DIR"
+trap 'echo "Cleaning up $TMP_ROOT…"; rm -rf "$TMP_ROOT"' EXIT
+
+# ── Download + extract ─────────────────────────────────────────────────────────
+step "Fetching espeak-ng $ESPEAK_VERSION"
+if [[ ! -f "$TARBALL" ]]; then
+    if command -v curl &>/dev/null; then
+        curl -fsSL -o "$TARBALL" "$TARBALL_URL"
+    elif command -v wget &>/dev/null; then
+        wget -q -O "$TARBALL" "$TARBALL_URL"
+    else
+        die "Neither curl nor wget found."
+    fi
 fi
 
-# ── Extract ───────────────────────────────────────────────────────────────────
-if [ ! -f "$SRC_DIR/CMakeLists.txt" ]; then
-    blue "Extracting…"
+if [[ ! -f "$SRC_DIR/CMakeLists.txt" ]]; then
     tar -xzf "$TARBALL" -C "$SRC_DIR" --strip-components=1
-    green "  extracted → $SRC_DIR"
 fi
+ok "Source ready: $SRC_DIR"
 
-# ── cmake configure ───────────────────────────────────────────────────────────
-blue "Configuring (cmake)…"
+# ── cmake configure ────────────────────────────────────────────────────────────
+step "CMake configure"
 cmake \
     -S "$SRC_DIR" \
-    -B "$BUILD_DIR" \
+    -B "$BLD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
-    -DBUILD_SHARED_LIBS=OFF
+    -DCMAKE_INSTALL_PREFIX="$INST_DIR" \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DUSE_MBROLA=OFF \
+    -DUSE_LIBSONIC=OFF \
+    -DUSE_LIBPCAUDIO=OFF \
+    -DUSE_ASYNC=OFF \
+    "${EXTRA_CMAKE[@]}" \
+    ${CMAKE_EXTRA_ARGS} \
+    || die "cmake configure failed."
 
-# ── Build ─────────────────────────────────────────────────────────────────────
-blue "Building with $JOBS jobs…"
-cmake --build "$BUILD_DIR" -j "$JOBS"
+# ── cmake build ───────────────────────────────────────────────────────────────
+step "CMake build ($JOBS threads)"
+cmake --build "$BLD_DIR" --config Release --parallel "$JOBS" \
+    || die "cmake build failed."
 
-# ── Install headers + data ────────────────────────────────────────────────────
-# espeak-ng 1.52.0's cmake install() skips static archives (LIBRARY keyword).
-# Run it to get headers and data, then copy the .a from the build tree.
-blue "Installing headers and data…"
-cmake --install "$BUILD_DIR" || true   # allowed to fail (skips .a)
+# ── cmake install (headers + data; .a install may be skipped by cmake) ────────
+step "Installing headers and data"
+cmake --install "$BLD_DIR" || true  # non-fatal: we copy libs manually below
 
-# ── Merge ALL .a files from build tree into one fat libespeak-ng.a ───────────
-#
-# espeak-ng 1.52.0 builds several companion archives alongside libespeak-ng.a:
-#   build/src/ucd-tools/libucd.a             (ucd_isalpha, ucd_isdigit, …)
-#   build/src/speechPlayer/libspeechPlayer.a (speechPlayer_initialize, …)
-#
-# libespeak-ng.a references symbols from these but does NOT bundle them.
-# We must merge everything into one fat archive so the linker is satisfied.
-# (Same approach as kittentts-rs ios/build_rust_ios.sh.)
-if [ ! -f "$STATIC_LIB" ]; then
-    mkdir -p "$INSTALL_DIR/lib"
+# ── Collect archives ───────────────────────────────────────────────────────────
+step "Collecting static archives"
+mapfile -t ALL_LIBS < <(find "$BLD_DIR" -name "*.a" 2>/dev/null | sort)
 
-    # Collect all .a files under the cmake build tree.
-    mapfile -t ALL_LIBS < <(find "$BUILD_DIR" -name "*.a" 2>/dev/null | sort)
-
-    if [ "${#ALL_LIBS[@]}" -eq 0 ]; then
-        die "No .a files found after building espeak-ng in $BUILD_DIR"
-    fi
-
-    blue "Merging ${#ALL_LIBS[@]} archive(s) into libespeak-ng.a…"
-    for L in "${ALL_LIBS[@]}"; do echo "  $L"; done
-
-    if command -v libtool >/dev/null 2>&1; then
-        # macOS: libtool -static is always available with Xcode CLT
-        libtool -static -o "$STATIC_LIB" "${ALL_LIBS[@]}"
-    else
-        # Linux: use ar -M with an MRI script
-        {
-            echo "CREATE $STATIC_LIB"
-            for L in "${ALL_LIBS[@]}"; do echo "ADDLIB $L"; done
-            echo "SAVE"
-            echo "END"
-        } | ar -M
-    fi
-
-    green "  merged → $STATIC_LIB"
-    echo "$ESPEAK_VERSION" > "$STAMP"
+if [[ ${#ALL_LIBS[@]} -eq 0 ]]; then
+    die "No .a files found after cmake build in $BLD_DIR"
 fi
 
-# ── Copy espeak-ng-data if cmake --install missed it ─────────────────────────
-DATA_DEST="$INSTALL_DIR/share/espeak-ng-data"
-if [ ! -d "$DATA_DEST" ] && [ -d "$SRC_DIR/espeak-ng-data" ]; then
-    mkdir -p "$INSTALL_DIR/share"
-    cp -r "$SRC_DIR/espeak-ng-data" "$DATA_DEST"
-    green "  copied espeak-ng-data → $DATA_DEST"
-fi
+for lib in "${ALL_LIBS[@]}"; do
+    name="$(basename "$lib")"
+    dest="$LIB_DIR/$name"
+    cp "$lib" "$dest"
+    ok "$(basename "$lib")  ($( du -sh "$lib" | cut -f1 ))"
+done
 
-# ── Result ────────────────────────────────────────────────────────────────────
-if [ -f "$STATIC_LIB" ]; then
-    green "\nDone!  Static library: $STATIC_LIB"
+# ── Merge into one fat archive ─────────────────────────────────────────────────
+step "Merging ${#ALL_LIBS[@]} archive(s) → libespeak-ng-merged.a"
+
+if [[ "$HOST_OS" == Darwin && -z "$CROSS_TARGET" ]]; then
+    # macOS native: libtool -static is always available with Xcode CLT.
+    libtool -static -o "$MERGED_LIB" "${ALL_LIBS[@]}" \
+        || die "libtool merge failed."
 else
-    # Shared lib is acceptable too (e.g. on systems where cmake ignores BUILD_SHARED_LIBS)
-    DYLIB=$(find "$INSTALL_DIR/lib" -name "libespeak-ng*.dylib" -o -name "libespeak-ng*.so*" 2>/dev/null | head -1)
-    if [ -n "$DYLIB" ]; then
-        green "\nDone! (dynamic library) $DYLIB"
-    else
-        die "Build completed but no library found in $INSTALL_DIR/lib"
-    fi
+    # Linux / cross to Windows-GNU: use ar MRI script.
+    {
+        echo "CREATE $MERGED_LIB"
+        for lib in "${ALL_LIBS[@]}"; do echo "ADDLIB $lib"; done
+        echo "SAVE"
+        echo "END"
+    } | "$AR" -M || die "ar MRI merge failed."
 fi
 
+ok "Merged: $MERGED_LIB  ($( du -sh "$MERGED_LIB" | cut -f1 ))"
+
+# ── Copy espeak-ng-data ────────────────────────────────────────────────────────
+DATA_DEST="$OUT_DIR/share/espeak-ng-data"
+if [[ ! -d "$DATA_DEST" ]]; then
+    for candidate in \
+        "$INST_DIR/share/espeak-ng-data" \
+        "$SRC_DIR/espeak-ng-data" \
+        "$BLD_DIR/espeak-ng-data"; do
+        if [[ -d "$candidate" ]]; then
+            mkdir -p "$OUT_DIR/share"
+            cp -r "$candidate" "$DATA_DEST"
+            ok "espeak-ng-data → $DATA_DEST"
+            break
+        fi
+    done
+fi
+
+# ── Stamp ──────────────────────────────────────────────────────────────────────
+echo "$ESPEAK_VERSION" > "$STAMP_FILE"
+
+# ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
-blue "Data directory:"
-DATA_DIR=$(find "$INSTALL_DIR/share" -type d -name "espeak-ng-data" 2>/dev/null | head -1)
-if [ -n "$DATA_DIR" ]; then
-    echo "  $DATA_DIR"
-    green ""
-    echo "Build with espeak support (build.rs finds the cache automatically):"
-    echo "  cargo build --features espeak"
-    echo ""
-    echo "Or point explicitly:"
-    echo "  ESPEAK_LIB_DIR=$INSTALL_DIR/lib cargo build --features espeak"
+echo "────────────────────────────────────────────────────"
+if [[ -n "$CROSS_TARGET" ]]; then
+    echo "  espeak-ng $ESPEAK_VERSION for $CROSS_TARGET ready!"
 else
-    warn "espeak-ng-data not found under $INSTALL_DIR — you may need to call"
-    warn "neutts::phonemize::set_data_path() at runtime"
+    echo "  espeak-ng $ESPEAK_VERSION ready!"
 fi
+echo ""
+echo "  Library : $MERGED_LIB"
+[[ -d "$DATA_DEST" ]] && echo "  Data    : $DATA_DEST"
+echo ""
+echo "  Build with:"
+echo "    cargo build --features espeak"
+echo ""
+echo "  Or set explicitly:"
+echo "    ESPEAK_LIB_DIR=$LIB_DIR cargo build --features espeak"
+echo "────────────────────────────────────────────────────"

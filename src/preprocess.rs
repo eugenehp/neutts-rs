@@ -158,9 +158,14 @@ fn ordinal_suffix(n: i64) -> String {
         .map(|(_, ord)| (*ord).to_string())
         .unwrap_or_else(|| {
             if last.ends_with('t') {
+                // e.g. "eight" → "eighth"
                 format!("{}h", last)
             } else if last.ends_with('e') {
+                // e.g. "nine" → "ninth" (drop 'e', add "th")
                 format!("{}th", &last[..last.len() - 1])
+            } else if last.ends_with('y') {
+                // e.g. "twenty" → "twentieth", "thirty" → "thirtieth"
+                format!("{}ieth", &last[..last.len() - 1])
             } else {
                 format!("{}th", last)
             }
