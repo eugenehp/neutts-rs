@@ -2777,9 +2777,9 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llama-cpp-4"
-version = "0.2.1"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4c4da413a6e09ae73254513857339653f2046429d4eb0a98f2070c842a185b9"
+checksum = "5d02a047f422938b0a6a9ac781fe66a5f0233755ac17aeb95b22ac3f03e6a8b6"
 dependencies = [
  "enumflags2",
  "llama-cpp-sys-4",
@@ -2789,9 +2789,9 @@ dependencies = [
 
 [[package]]
 name = "llama-cpp-sys-4"
-version = "0.2.1"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2710d6dfe302f598b3b49ed8cdb00ebc8c95a7a20c4cfa16bf986fb4dcc23407"
+checksum = "5a51785e86b765dff0eb4d869a26e537c5c53695115895380b9bee4c1e893ca0"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
@@ -3042,7 +3042,7 @@ dependencies = [
 
 [[package]]
 name = "neutts"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "anyhow",
  "burn",

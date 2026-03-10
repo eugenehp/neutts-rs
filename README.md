@@ -1,6 +1,6 @@
 # neutts-rs
 
-[![Version](https://img.shields.io/badge/version-0.0.6-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.0.7-blue)](CHANGELOG.md)
 
 Rust port of [NeuTTS](https://github.com/neuphonic/neutts) — on-device voice-cloning TTS
 built on a GGUF LLM backbone and the [NeuCodec](https://huggingface.co/neuphonic/neucodec)
@@ -326,6 +326,7 @@ Each has a `.wav` (original audio), `.npy` (pre-encoded tokens), and `.txt` (tra
 | `wgpu` | | GPU-accelerated codec via Burn wgpu (Metal/Vulkan/DX12); auto-falls back to Burn NdArray CPU, then raw ndarray |
 | `metal` | | macOS Metal GPU for the backbone |
 | `cuda` | | NVIDIA CUDA for the backbone |
+| `vulkan` | | Vulkan GPU for the backbone (Linux/Windows, requires `libvulkan1`) |
 | `fast` | ✓ | RoPE: degree-7/6 Horner polynomial (~1 × 10⁻⁴ error, no transcendental calls) |
 | `precise` | | RoPE: stdlib `f32::sin_cos()`, correctly rounded; mutually exclusive with `fast` |
 
@@ -638,7 +639,7 @@ If you use this software in your research or project, please cite it as:
   title        = {{neutts}: Rust port of {NeuTTS} — on-device voice-cloning {TTS}
                   with {GGUF} backbone and {NeuCodec} decoder},
   year         = {2026},
-  version      = {0.0.6},
+  version      = {0.0.7},
   license      = {MIT},
   url          = {https://github.com/eugenehp/neutts-rs}
 }

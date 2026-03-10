@@ -14,6 +14,43 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.0.7] — 2026-03-10
+
+### Changed
+
+#### `llama-cpp-4` dependency: `0.2.0` → `0.2.5`
+- Pinned `llama-cpp-4` to `"0.2.5"` in `Cargo.toml`; `llama-cpp-sys-4` is
+  correspondingly bumped from `0.2.0` to `0.2.5`, bringing in the latest
+  llama.cpp snapshot.
+- The 0.2.x API is backward-compatible: all existing call sites in
+  `src/backbone.rs` compile unchanged.
+
+#### `src/backbone.rs` — sampler: add top-p (llama-cpp-4 0.2.5)
+- `LlamaSampler::top_p(0.9, 1)` is now inserted between `top_k` and `temp`
+  in both `generate` and `generate_streaming`.  The chain is now:
+  `top_k(50) → top_p(0.9) → temp(1.0) → dist(seed)`.
+- Seed derivation now goes through `LlamaSamplerParams::default()
+  .with_seed(rand::random()).seed()` — this uses the new `LlamaSamplerParams`
+  type introduced in 0.2.5 and gives the sampler a deterministic seed when
+  `BackboneModel::seed` is `None`.
+- `token_to_piece` helper refactored to call `token_to_str_with_size` (the
+  higher-level string-returning API) instead of `token_to_bytes_with_size`
+  followed by a lossy UTF-8 conversion.  The retry-on-small-buffer logic is
+  preserved.
+
+### Added
+
+#### `vulkan` Cargo feature
+- New `vulkan = ["llama-cpp-4?/vulkan"]` feature enables the Vulkan GPU
+  backend for the GGUF backbone on Linux and Windows (requires a Vulkan
+  runtime, e.g. `apt install libvulkan1`):
+  ```
+  cargo build --features "backbone,vulkan"
+  ```
+  Complements the existing `metal` (macOS) and `cuda` (NVIDIA) features.
+
+---
+
 ## [0.0.6] — 2026-03-10
 
 ### Added — test suite (`tests/`)

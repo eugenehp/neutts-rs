@@ -1,15 +1,16 @@
 //! GGUF backbone — runs the NeuTTS LLM that generates speech token IDs.
 //!
-//! Wraps [`llama_cpp_4`] (Rust bindings to llama.cpp) to load a GGUF model
-//! and run token generation with temperature + top-k sampling.
+//! Wraps [`llama_cpp_4`] v0.2.5 (Rust bindings to llama.cpp) to load a GGUF
+//! model and run token generation with temperature + top-k + top-p sampling.
 //!
 //! ## Pipeline
 //!
 //! 1. Prompt (text + reference codes) is tokenised by the GGUF model's
 //!    built-in tokeniser (which includes the special `<|speech_N|>` tokens).
 //! 2. Prompt tokens are fed into the KV cache via `ctx.decode()`.
-//! 3. New tokens are sampled (temperature=1.0, top-k=50) until the model
-//!    emits `<|SPEECH_GENERATION_END|>` or the context limit is reached.
+//! 3. New tokens are sampled (top-k=50, top-p=0.9, temperature=1.0) until
+//!    the model emits `<|SPEECH_GENERATION_END|>` or the context limit is
+//!    reached.
 //! 4. The generated text is returned; the caller extracts speech token IDs
 //!    with [`crate::tokens::extract_ids`].
 
@@ -22,7 +23,7 @@ use llama_cpp_4::{
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, AddBos, LlamaModel, Special},
-    sampling::LlamaSampler,
+    sampling::{LlamaSampler, LlamaSamplerParams},
 };
 
 use crate::tokens::STOP_TOKEN;
@@ -113,12 +114,15 @@ impl BackboneModel {
         }
         ctx.decode(&mut batch).context("Prompt decode failed")?;
 
-        // ── Sampler: top-k(50) → temperature(1.0) → random distribution ───────
-        // llama-cpp-4 v0.2+ API: static constructors + chain_simple([...])
-        let seed = self.seed.unwrap_or_else(rand::random::<u32>);
+        // ── Sampler: top-k(50) → top-p(0.9) → temperature(1.0) → dist ────────
+        // llama-cpp-4 v0.2.5 adds top_p; we wire it after top_k.
+        // LlamaSamplerParams carries the seed; top_k/top_p defaults are 50/0.9.
+        let seed = self.seed
+            .unwrap_or_else(|| LlamaSamplerParams::default().with_seed(rand::random()).seed());
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::top_k(50),
-            LlamaSampler::temp(1.0),
+            LlamaSampler::top_p(0.9, 1),
+            LlamaSampler::temp(1.0),   // NeuTTS uses temp=1.0 (higher diversity)
             LlamaSampler::dist(seed),
         ]);
 
@@ -237,10 +241,12 @@ impl BackboneModel {
         }
         ctx.decode(&mut batch).context("Prompt decode failed")?;
 
-        // ── Sampler ───────────────────────────────────────────────────────────
-        let seed = self.seed.unwrap_or_else(rand::random::<u32>);
+        // ── Sampler: top-k(50) → top-p(0.9) → temperature(1.0) → dist ────────
+        let seed = self.seed
+            .unwrap_or_else(|| LlamaSamplerParams::default().with_seed(rand::random()).seed());
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::top_k(50),
+            LlamaSampler::top_p(0.9, 1),
             LlamaSampler::temp(1.0),
             LlamaSampler::dist(seed),
         ]);
@@ -290,26 +296,24 @@ impl BackboneModel {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Decode a single token to a UTF-8 string using the
-/// `token_to_bytes_with_size` API (llama-cpp-4 ≥ 0.2.x).
+/// Decode a single llama token to a UTF-8 string (llama-cpp-4 0.2.5).
 ///
-/// `Special::Tokenize` ensures that special tokens like `<|speech_N|>` are
-/// rendered as their text representation rather than as a placeholder byte.
+/// Uses `token_to_str_with_size` with an initial 64-byte buffer — large
+/// enough for every NeuTTS speech token (`<|speech_65535|>` is 20 bytes).
+/// If the buffer ever proves too small the error carries the required size
+/// and we retry once.  `Special::Tokenize` ensures that special tokens such
+/// as `<|speech_N|>` are rendered as their text representation.
 fn token_to_piece(model: &LlamaModel, token: llama_cpp_4::token::LlamaToken) -> Result<String> {
     use llama_cpp_4::TokenToStringError;
 
-    // Start with a 64-byte buffer; retry with the exact size if too small.
-    let bytes = match model.token_to_bytes_with_size(token, 64, Special::Tokenize, None) {
-        Ok(b) => b,
+    match model.token_to_str_with_size(token, 64, Special::Tokenize) {
+        Ok(s) => Ok(s),
         Err(TokenToStringError::InsufficientBufferSpace(needed)) => {
             let size = needed.unsigned_abs() as usize + 1;
-            model.token_to_bytes_with_size(token, size, Special::Tokenize, None)
-                .context("token_to_bytes_with_size retry failed")?
+            model
+                .token_to_str_with_size(token, size, Special::Tokenize)
+                .map_err(|e| anyhow::anyhow!("token decode retry failed: {e}"))
         }
-        Err(e) => return Err(anyhow::anyhow!("token decode error: {e}")),
-    };
-
-    // The bytes are typically valid UTF-8 but may contain lone bytes for
-    // partial multi-byte sequences mid-stream; use lossy conversion.
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Err(e) => Err(anyhow::anyhow!("token decode error: {e}")),
+    }
 }

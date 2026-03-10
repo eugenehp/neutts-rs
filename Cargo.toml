@@ -1,6 +1,6 @@
 [package]
 name = "neutts"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 authors = ["Eugene Hauptmann"]
 description = "Rust port of NeuTTS — on-device voice-cloning TTS with GGUF backbone and NeuCodec decoder"
@@ -29,6 +29,7 @@ espeak   = []
 wgpu     = ["dep:burn"]  # GPU-accelerated NeuCodec decoder via Burn wgpu backend
 metal    = ["llama-cpp-4?/metal"]
 cuda     = ["llama-cpp-4?/cuda"]
+vulkan   = ["llama-cpp-4?/vulkan"]   # Vulkan GPU backend for the backbone (Linux/Windows)
 # verbose — when absent, llama.cpp / ggml log output is silenced at runtime.
 # Pass `--features verbose` to cargo build/run to restore the raw log stream.
 verbose  = []
@@ -121,7 +122,7 @@ features = ["std", "wgpu", "ndarray"]
 
 # ── GGUF backbone — optional ─────────────────────────────────────────────────
 [dependencies.llama-cpp-4]
-version = "0.2"
+version = "0.2.5"
 optional = true
 
 # ── Desktop-only dependencies ─────────────────────────────────────────────────
