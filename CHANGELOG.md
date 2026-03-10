@@ -6,6 +6,35 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Planned
+- Pure-Rust NeuCodec encoder (removes Python dependency for reference encoding).
+- iOS / Android build guides and pre-built XCFramework.
+
+---
+
+## [0.0.5] — 2026-03-09
+
+### Changed
+
+#### Backbone dependency: `llama-cpp-2` → `llama-cpp-4`
+- Replaced `llama-cpp-2 v0.1` with `llama-cpp-4 v0.2` as the GGUF backbone
+  binding crate (`Cargo.toml`, `src/backbone.rs`).
+- `token_to_piece_bytes(token, N, true, None)` replaced by
+  `token_to_bytes_with_size(token, N, Special::Tokenize, None)` — the
+  function was renamed in llama-cpp-4 and the `bool` special-token flag
+  became the typed `Special` enum.
+- `Special` imported alongside `AddBos`, `LlamaModel`, and
+  `LlamaModelParams` from `llama_cpp_4::model`.
+- `metal` and `cuda` feature pass-throughs updated:
+  `llama-cpp-2?/metal` → `llama-cpp-4?/metal`,
+  `llama-cpp-2?/cuda` → `llama-cpp-4?/cuda`.
+- All doc comments and the README architecture diagram updated to reference
+  `llama-cpp-4`.
+
+---
+
 ## [0.0.1] — 2026-03-04
 
 ### Added
@@ -144,14 +173,6 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of substring matching.
 - README fully rewritten: quick-start uses `speak`, full model table, API
   examples updated for new `load_from_hub_cb` signature, citation block added.
-
----
-
-## [Unreleased]
-
-### Planned
-- Pure-Rust NeuCodec encoder (removes Python dependency for reference encoding).
-- iOS / Android build guides and pre-built XCFramework.
 
 ---
 

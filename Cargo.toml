@@ -1,6 +1,6 @@
 [package]
 name = "neutts"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 authors = ["Eugene Hauptmann"]
 description = "Rust port of NeuTTS — on-device voice-cloning TTS with GGUF backbone and NeuCodec decoder"
@@ -13,7 +13,7 @@ exclude = ["ios", "android"]
 
 # ── Feature flags ────────────────────────────────────────────────────────────
 #
-# backbone — links llama-cpp-2 (builds llama.cpp via cmake + C++ compiler).
+# backbone — links llama-cpp-4 (builds llama.cpp via cmake + C++ compiler).
 #            Enables load_backbone(), generate_*().
 #
 # espeak   — links libespeak-ng; enables raw-text input (text → IPA → model).
@@ -21,14 +21,14 @@ exclude = ["ios", "android"]
 # wgpu     — Burn wgpu GPU backend for NeuCodec decoder.
 #            Tries wgpu (Metal/Vulkan/DX12) → Burn NdArray CPU → raw ndarray.
 #
-# metal / cuda — GPU acceleration for the backbone only (passed to llama-cpp-2).
+# metal / cuda — GPU acceleration for the backbone only (passed to llama-cpp-4).
 [features]
 default  = ["backbone", "fast"]
-backbone = ["dep:llama-cpp-2"]
+backbone = ["dep:llama-cpp-4"]
 espeak   = []
 wgpu     = ["dep:burn"]  # GPU-accelerated NeuCodec decoder via Burn wgpu backend
-metal    = ["llama-cpp-2?/metal"]
-cuda     = ["llama-cpp-2?/cuda"]
+metal    = ["llama-cpp-4?/metal"]
+cuda     = ["llama-cpp-4?/cuda"]
 # verbose — when absent, llama.cpp / ggml log output is silenced at runtime.
 # Pass `--features verbose` to cargo build/run to restore the raw log stream.
 verbose  = []
@@ -120,8 +120,8 @@ default-features = false
 features = ["std", "wgpu", "ndarray"]
 
 # ── GGUF backbone — optional ─────────────────────────────────────────────────
-[dependencies.llama-cpp-2]
-version = "0.1"
+[dependencies.llama-cpp-4]
+version = "0.2"
 optional = true
 
 # ── Desktop-only dependencies ─────────────────────────────────────────────────

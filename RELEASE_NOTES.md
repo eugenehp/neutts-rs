@@ -1,3 +1,49 @@
+# Release notes — neutts-rs 0.0.5
+
+_2026-03-09_
+
+---
+
+## Highlights
+
+### Backbone binding upgraded to `llama-cpp-4`
+
+The GGUF backbone now uses [`llama-cpp-4 v0.2`](https://crates.io/crates/llama-cpp-4)
+instead of `llama-cpp-2 v0.1`.  `llama-cpp-4` tracks a newer llama.cpp
+revision with additional sampler primitives, multimodal support, and RPC
+backend capabilities, while keeping the core inference API stable.
+
+The only code-level change is in the token-decoding helper: the old
+`token_to_piece_bytes(token, N, true, None)` call was replaced by
+`token_to_bytes_with_size(token, N, Special::Tokenize, None)` — the function
+was renamed and the boolean special-token flag became the typed `Special` enum.
+All other public API surfaces (`LlamaBackend`, `LlamaModel`, `LlamaBatch`,
+`LlamaContextParams`, `LlamaSampler`, etc.) are unchanged.
+
+---
+
+## Upgrade notes
+
+### No breaking changes
+
+All existing call sites are unaffected.  The change is confined to
+`Cargo.toml` and the internal `token_to_piece` helper in `src/backbone.rs`.
+
+### Rebuilding from scratch
+
+Because the underlying native library (`llama-cpp-sys-4`) is a different crate
+from `llama-cpp-sys-2`, Cargo will download and compile fresh C++ sources on
+the first build after upgrading.  Build time is the same as before (~1–2 min
+depending on machine).
+
+---
+
+## Full changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the complete entry-by-entry record.
+
+---
+
 # Release notes — neutts-rs 0.0.2
 
 _2026-03-05_

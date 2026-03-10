@@ -1756,15 +1756,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "find_cuda_helper"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f9e65c593dd01ac77daad909ea4ad17f0d6d1776193fc8ea766356177abdad"
-dependencies = [
- "glob",
-]
-
-[[package]]
 name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2785,31 +2776,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
-name = "llama-cpp-2"
-version = "0.1.138"
+name = "llama-cpp-4"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2947ab625c59d1fdf42e61f538c3fa66f43de2f78316971920873f359483d1d8"
+checksum = "a4c4da413a6e09ae73254513857339653f2046429d4eb0a98f2070c842a185b9"
 dependencies = [
- "encoding_rs",
  "enumflags2",
- "llama-cpp-sys-2",
+ "llama-cpp-sys-4",
  "thiserror 2.0.18",
  "tracing",
- "tracing-core",
 ]
 
 [[package]]
-name = "llama-cpp-sys-2"
-version = "0.1.138"
+name = "llama-cpp-sys-4"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84a529006bf16af70c7485ba957820dc2bc9467d75697e97970c81d2da73c76f"
+checksum = "2710d6dfe302f598b3b49ed8cdb00ebc8c95a7a20c4cfa16bf986fb4dcc23407"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
  "cmake",
- "find_cuda_helper",
  "glob",
- "walkdir",
 ]
 
 [[package]]
@@ -3063,7 +3050,7 @@ dependencies = [
  "fancy-regex",
  "hf-hub",
  "hound",
- "llama-cpp-2",
+ "llama-cpp-4",
  "memmap2",
  "ndarray 0.16.1",
  "once_cell",
@@ -4712,7 +4699,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
- "valuable",
 ]
 
 [[package]]
@@ -4886,12 +4872,6 @@ name = "uuid"
 version = "1.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "variadics_please"

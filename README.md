@@ -245,7 +245,7 @@ cargo run --example speak --features espeak -- \
 ```
 text ──► espeak-ng ──► IPA ──┐
                               ├──► prompt builder ──► GGUF backbone ──► speech tokens
-ref_codes (.npy) ─────────────┘                          (llama-cpp-2)        │
+ref_codes (.npy) ─────────────┘                          (llama-cpp-4)        │
                                                                                ▼
                                                                    NeuCodec decoder
                                                               (Burn wgpu GPU  ──or──
@@ -258,7 +258,7 @@ ref_codes (.npy) ─────────────┘                     
 
 ### GGUF backbone
 
-Small causal LM in GGUF format, run via `llama-cpp-2`.  Takes a phonemized text
+Small causal LM in GGUF format, run via `llama-cpp-4`.  Takes a phonemized text
 prompt and pre-encoded reference speaker codes, generates `<|speech_N|>` tokens
 one at a time.  The `generate_streaming` API forwards each token to a callback
 immediately, enabling low-latency audio delivery.
@@ -319,7 +319,7 @@ Each has a `.wav` (original audio), `.npy` (pre-encoded tokens), and `.txt` (tra
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `backbone` | ✓ | GGUF backbone via `llama-cpp-2` (requires cmake + C++) |
+| `backbone` | ✓ | GGUF backbone via `llama-cpp-4` (requires cmake + C++) |
 | `espeak` | | Raw-text input via `libespeak-ng` |
 | `wgpu` | | GPU-accelerated codec via Burn wgpu (Metal/Vulkan/DX12); auto-falls back to Burn NdArray CPU, then raw ndarray |
 | `metal` | | macOS Metal GPU for the backbone |

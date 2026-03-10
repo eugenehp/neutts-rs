@@ -11,7 +11,7 @@
 //!                               +  ref codes ──►
 //! ```
 //!
-//! 1. **GGUF backbone** (`llama-cpp-2`) — a small causal LM that generates speech token IDs.
+//! 1. **GGUF backbone** (`llama-cpp-4`) — a small causal LM that generates speech token IDs.
 //! 2. **NeuCodec decoder** — pure-Rust FSQ+Vocos+ISTFT decoder; 24 kHz output.
 //!
 //! ## One-time setup
@@ -38,11 +38,11 @@
 //!
 //! | Feature    | Default | Effect                                                                       |
 //! |------------|---------|------------------------------------------------------------------------------|
-//! | `backbone` | ✓       | GGUF backbone via llama-cpp-2 (requires cmake + C++)                         |
+//! | `backbone` | ✓       | GGUF backbone via llama-cpp-4 (requires cmake + C++)                         |
 //! | `espeak`   |         | Raw-text input via libespeak-ng                                              |
 //! | `wgpu`     |         | GPU-accelerated codec via Burn wgpu; falls back to Burn NdArray then ndarray |
-//! | `metal`    |         | macOS Metal GPU for the backbone (passed to llama-cpp-2)                     |
-//! | `cuda`     |         | NVIDIA CUDA for the backbone (passed to llama-cpp-2)                         |
+//! | `metal`    |         | macOS Metal GPU for the backbone (passed to llama-cpp-4)                     |
+//! | `cuda`     |         | NVIDIA CUDA for the backbone (passed to llama-cpp-4)                         |
 //! | `fast`     | ✓       | RoPE: degree-7/6 Horner polynomial, no transcendental calls (~1e-4 error)    |
 //! | `precise`  |         | RoPE: stdlib `f32::sin_cos()`, correctly rounded; mutually exclusive w/ fast |
 
