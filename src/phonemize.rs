@@ -225,6 +225,101 @@ mod tests {
     }
 
     #[test]
+    fn test_available_german() {
+        assert!(is_espeak_available("de"));
+    }
+
+    #[test]
+    fn test_available_french() {
+        assert!(is_espeak_available("fr-fr"));
+    }
+
+    #[test]
+    fn test_available_spanish() {
+        assert!(is_espeak_available("es"));
+    }
+
+    #[test]
+    fn test_bogus_language_does_not_crash() {
+        // A completely bogus language code should not crash.
+        // The pure-Rust espeak-ng may accept unknown codes (falls back to default),
+        // so we only verify it doesn't panic.
+        let _ = is_espeak_available("zz-nonexistent-999");
+        // phonemize should either succeed or return an error, never panic.
+        let result = phonemize("hello", "zz-nonexistent-999");
+        match result {
+            Ok(ipa) => println!("Bogus lang produced IPA (fallback): {ipa}"),
+            Err(e) => println!("Bogus lang returned error (expected): {e}"),
+        }
+    }
+
+    #[test]
+    fn test_lang_mapping_en_us() {
+        // en-us should map to en internally and produce valid IPA
+        let ipa = phonemize("test", "en-us").expect("phonemize en-us failed");
+        assert!(!ipa.is_empty(), "en-us should produce IPA");
+    }
+
+    #[test]
+    fn test_numbers_produce_ipa() {
+        let ipa = phonemize("123", "en-us").expect("phonemize numbers failed");
+        assert!(!ipa.is_empty(), "numbers should produce IPA: got empty");
+    }
+
+    #[test]
+    fn test_long_text() {
+        let long = "The quick brown fox jumps over the lazy dog. ".repeat(20);
+        let ipa = phonemize(&long, "en-us").expect("phonemize long text failed");
+        assert!(!ipa.is_empty(), "long text should produce IPA");
+    }
+
+    #[test]
+    fn test_french_produces_ipa() {
+        let ipa = phonemize("Bonjour le monde", "fr-fr").expect("phonemize fr-fr failed");
+        assert!(!ipa.is_empty(), "French should produce IPA");
+        assert!(!ipa.contains('-'), "French IPA should have dashes stripped: {ipa}");
+        // Should contain some recognizable French phonemes
+        assert!(
+            ipa.contains('b') || ipa.contains('ɔ') || ipa.contains('ʒ'),
+            "unexpected French IPA for 'Bonjour le monde': {ipa}"
+        );
+    }
+
+    #[test]
+    fn test_punctuation_only() {
+        // Punctuation-only input should not crash
+        let ipa = phonemize("...", "en-us").expect("phonemize punctuation failed");
+        // May be empty, but should not error
+        let _ = ipa;
+    }
+
+    #[test]
+    fn test_unicode_input() {
+        // Non-Latin input to English voice should not crash
+        let ipa = phonemize("café résumé naïve", "en-us").expect("phonemize unicode failed");
+        assert!(!ipa.is_empty(), "accented text should produce IPA");
+    }
+
+    #[test]
+    fn test_concurrent_phonemize() {
+        // The pure-Rust engine creates a new instance per call, so
+        // concurrent access should be safe.
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let text = format!("Thread number {i} says hello");
+                    phonemize(&text, "en-us").expect("concurrent phonemize failed")
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let ipa = h.join().expect("thread panicked");
+            assert!(!ipa.is_empty(), "concurrent call should produce IPA");
+        }
+    }
+
+    #[test]
     fn test_all_bundled_languages() {
         let sample_texts: &[(&str, &str)] = &[
             ("af", "Hallo wêreld"),
