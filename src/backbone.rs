@@ -1,6 +1,6 @@
 //! GGUF backbone — runs the NeuTTS LLM that generates speech token IDs.
 //!
-//! Wraps [`llama_cpp_4`] v0.2.5 (Rust bindings to llama.cpp) to load a GGUF
+//! Wraps [`llama_cpp_4`] v0.2.17 (Rust bindings to llama.cpp) to load a GGUF
 //! model and run token generation with temperature + top-k + top-p sampling.
 //!
 //! ## Pipeline
@@ -115,7 +115,7 @@ impl BackboneModel {
         ctx.decode(&mut batch).context("Prompt decode failed")?;
 
         // ── Sampler: top-k(50) → top-p(0.9) → temperature(1.0) → dist ────────
-        // llama-cpp-4 v0.2.5 adds top_p; we wire it after top_k.
+        // llama-cpp-4: top_p wired after top_k.
         // LlamaSamplerParams carries the seed; top_k/top_p defaults are 50/0.9.
         let seed = self.seed
             .unwrap_or_else(|| LlamaSamplerParams::default().with_seed(rand::random()).seed());
@@ -296,7 +296,7 @@ impl BackboneModel {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Decode a single llama token to a UTF-8 string (llama-cpp-4 0.2.5).
+/// Decode a single llama token to a UTF-8 string.
 ///
 /// Uses `token_to_str_with_size` with an initial 64-byte buffer — large
 /// enough for every NeuTTS speech token (`<|speech_65535|>` is 20 bytes).

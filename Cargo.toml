@@ -1,6 +1,6 @@
 [package]
 name = "neutts"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Eugene Hauptmann"]
 description = "Rust port of NeuTTS — on-device voice-cloning TTS with GGUF backbone and NeuCodec decoder"
@@ -125,7 +125,7 @@ features = ["std", "wgpu", "ndarray"]
 
 # ── GGUF backbone — optional ─────────────────────────────────────────────────
 [dependencies.llama-cpp-4]
-version = "0.2.5"
+version = "0.2.17"
 optional = true
 
 # ── Desktop-only dependencies ─────────────────────────────────────────────────
