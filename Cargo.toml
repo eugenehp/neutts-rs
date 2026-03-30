@@ -1,6 +1,6 @@
 [package]
 name = "neutts"
-version = "0.0.7"
+version = "0.1.0"
 edition = "2021"
 authors = ["Eugene Hauptmann"]
 description = "Rust port of NeuTTS — on-device voice-cloning TTS with GGUF backbone and NeuCodec decoder"
@@ -25,7 +25,7 @@ exclude = ["ios", "android"]
 [features]
 default  = ["backbone", "fast"]
 backbone = ["dep:llama-cpp-4"]
-espeak   = []
+espeak   = ["dep:espeak-ng"]
 wgpu     = ["dep:burn"]  # GPU-accelerated NeuCodec decoder via Burn wgpu backend
 metal    = ["llama-cpp-4?/metal"]
 cuda     = ["llama-cpp-4?/cuda"]
@@ -81,6 +81,9 @@ serde_json = "1"
 # Error handling
 anyhow = "1"
 thiserror = "1"
+
+# Pure-Rust eSpeak NG (optional, behind `espeak` feature)
+espeak-ng = { version = "0.1", optional = true, features = ["bundled-data"] }
 
 # Random seed for sampling
 rand = "0.8"

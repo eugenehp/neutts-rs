@@ -1,10 +1,10 @@
-//! Phonemisation using the `libespeak-ng` C library.
+//! Phonemisation using the pure-Rust `espeak-ng` crate.
 //!
 //! Mirrors the Python `BasePhonemizer` + `FrenchPhonemizer` from `neutts/phonemizers.py`.
 //! The full implementation is compiled only when the **`espeak`** Cargo feature
 //! is enabled.  Without it, all public functions are still present but return
 //! informative errors so downstream callers using `generate_from_ipa()` compile
-//! without a system libespeak-ng.
+//! without any espeak dependency.
 //!
 //! ## Supported languages
 //!
@@ -15,6 +15,8 @@
 //! | French     | `fr-fr` | NeuTTS-Nano-French; dashes stripped        |
 //! | Spanish    | `es`    | NeuTTS-Nano-Spanish                        |
 //!
+//! All 114 bundled espeak-ng languages are available.
+//!
 //! ## Enabling
 //!
 //! ```toml
@@ -23,11 +25,9 @@
 //!
 //! ## Build requirements (when `espeak` feature is on)
 //!
-//! | Platform       | Requirement                                              |
-//! |----------------|----------------------------------------------------------|
-//! | Alpine / Linux | `apk add espeak-ng-dev` / `apt install libespeak-ng-dev` |
-//! | macOS          | `brew install espeak-ng`                                 |
-//! | iOS / Android  | Cross-compiled `libespeak-ng.{a,so}`; set `ESPEAK_LIB_DIR` at build time and [`set_data_path`] at runtime |
+//! **None!** The `espeak-ng` crate is a pure-Rust port that bundles its own
+//! data files for all 114 languages.  No system library, no pkg-config, no
+//! cmake needed.
 
 use std::path::{Path, PathBuf};
 use anyhow::Result;
@@ -39,124 +39,90 @@ use once_cell::sync::OnceCell;
 
 static DATA_PATH: OnceCell<PathBuf> = OnceCell::new();
 
-/// Set the path to the `espeak-ng-data` directory.
+/// Set the path to the espeak-ng data directory.
 ///
-/// **Required on iOS and Android**: bundle `espeak-ng-data/` with the app and
-/// call this with its runtime path before any call to [`phonemize`].
+/// With the pure-Rust `espeak-ng` crate and bundled data, this is **optional**.
+/// Call this only if you need to override the bundled data directory (e.g. for
+/// custom dictionaries).
 ///
-/// Optional on desktop — if not called the library searches its compiled-in
-/// system path.
+/// Has no effect if called after [`phonemize`] has already initialised the
+/// engine.
 pub fn set_data_path(path: &Path) {
     let _ = DATA_PATH.set(path.to_path_buf());
 }
 
-// ─── espeak feature: full FFI implementation ──────────────────────────────────
+// ─── espeak feature: pure-Rust implementation ─────────────────────────────────
 
 #[cfg(feature = "espeak")]
 mod inner {
-    use std::ffi::{CStr, CString};
-    use std::os::raw::{c_char, c_int, c_void};
-    use std::sync::Mutex;
+    use std::path::PathBuf;
 
     use anyhow::{anyhow, Result};
     use once_cell::sync::OnceCell;
 
     use super::DATA_PATH;
 
-    // NEUTTS_ESPEAK_STAMP is set by build.rs to the content of
-    // espeak-static/install/lib/espeak-ng-merged.stamp.  When the merged
-    // library is rebuilt (stamp changes → build script re-runs → this value
-    // changes), Cargo recompiles this module and re-bundles the fresh objects.
-    #[allow(dead_code)]
-    const _ESPEAK_STAMP: &str = env!("NEUTTS_ESPEAK_STAMP");
+    /// Lazily-initialised data directory for the bundled espeak-ng data.
+    static BUNDLED_DATA_DIR: OnceCell<PathBuf> = OnceCell::new();
 
-    extern "C" {
-        fn espeak_ng_InitializePath(path: *const c_char);
-        fn espeak_ng_Initialize(context: *mut c_void) -> c_int;
-        fn espeak_ng_SetVoiceByName(name: *const c_char) -> c_int;
-        fn espeak_TextToPhonemes(
-            textptr: *mut *const c_void,
-            textmode: c_int,
-            phonememode: c_int,
-        ) -> *const c_char;
+    /// Get or create the data directory with bundled espeak-ng data installed.
+    fn get_data_dir() -> Result<&'static PathBuf> {
+        if let Some(user_dir) = DATA_PATH.get() {
+            return Ok(BUNDLED_DATA_DIR.get_or_init(|| user_dir.clone()));
+        }
+
+        BUNDLED_DATA_DIR.get_or_try_init(|| {
+            let cache_dir = std::env::temp_dir().join("neutts-espeak-ng-data");
+            std::fs::create_dir_all(&cache_dir)
+                .map_err(|e| anyhow!("Failed to create espeak-ng data dir: {}", e))?;
+
+            espeak_ng::install_bundled_data(&cache_dir)
+                .map_err(|e| anyhow!("Failed to install bundled espeak-ng data: {}", e))?;
+
+            Ok(cache_dir)
+        })
     }
 
-    const CHARS_UTF8:  c_int = 1;
-    const PHONEMES_IPA: c_int = 0x02;
-
-    /// Serialises all espeak-ng calls (the library uses global state).
-    pub(super) static LOCK: Mutex<()> = Mutex::new(());
-
-    /// Cached initialisation result, keyed by language code.
-    /// We re-initialise when the language changes.
-    pub(super) static INIT: OnceCell<std::result::Result<(), String>> = OnceCell::new();
-
-    /// Initialise espeak-ng with the given language voice.
-    pub(super) fn do_init(lang: &str) -> std::result::Result<(), String> {
-        unsafe {
-            // Resolve data path in priority order:
-            //   1. Runtime call to set_data_path()           — highest priority
-            //   2. NEUTTS_ESPEAK_DATA_DIR env var baked in   — set by build.rs
-            //      at compile time when building from source
-            //   3. NULL → espeak-ng uses its compiled-in     — system installs
-            //      system path (e.g. /usr/lib/…/espeak-ng-data)
-            let path_cstr: Option<CString> = DATA_PATH
-                .get()
-                .map(|p| p.to_string_lossy().into_owned())
-                .or_else(|| option_env!("NEUTTS_ESPEAK_DATA_DIR").map(str::to_owned))
-                .and_then(|s| CString::new(s.into_bytes()).ok());
-            let path_ptr: *const c_char =
-                path_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-            espeak_ng_InitializePath(path_ptr);
-            let status = espeak_ng_Initialize(std::ptr::null_mut());
-            if status != 0 {
-                return Err(format!(
-                    "espeak_ng_Initialize failed (status {:#010x})",
-                    status
-                ));
-            }
-            let voice = CString::new(lang).unwrap();
-            let rc = espeak_ng_SetVoiceByName(voice.as_ptr());
-            if rc != 0 {
-                return Err(format!(
-                    "espeak_ng_SetVoiceByName(\"{lang}\") failed (rc {rc})"
-                ));
-            }
+    /// Map NeuTTS language codes to espeak-ng language codes.
+    ///
+    /// espeak-ng uses short codes like "en", "fr", "de", "es" while NeuTTS
+    /// uses "en-us", "fr-fr".  We map to the base language for the pure-Rust
+    /// crate.
+    fn map_lang(lang: &str) -> &str {
+        match lang {
+            "en-us" => "en",
+            "fr-fr" => "fr",
+            other   => other,
         }
-        Ok(())
+    }
+
+    fn create_engine(lang: &str) -> Result<espeak_ng::EspeakNg> {
+        let data_dir = get_data_dir()?;
+        let mapped = map_lang(lang);
+        espeak_ng::EspeakNg::with_data_dir(mapped, data_dir)
+            .map_err(|e| anyhow!("espeak-ng init for '{}' failed: {}", lang, e))
     }
 
     pub(super) fn is_available(lang: &str) -> bool {
-        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        INIT.get_or_init(|| do_init(lang)).is_ok()
+        create_engine(lang).is_ok()
     }
 
     pub(super) fn run_phonemize(text: &str, lang: &str) -> Result<String> {
-        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
-        INIT.get_or_init(|| do_init(lang))
-            .as_ref()
-            .map_err(|e| anyhow!("espeak-ng: {}", e))?;
-
-        let text_c = CString::new(text)
-            .map_err(|_| anyhow!("phonemize: text contains a null byte"))?;
-
-        let mut current: *const c_void = text_c.as_ptr() as *const c_void;
-        let mut parts: Vec<String> = Vec::new();
-
-        unsafe {
-            while !current.is_null() {
-                let ptr = espeak_TextToPhonemes(&mut current, CHARS_UTF8, PHONEMES_IPA);
-                if ptr.is_null() { continue; }
-                let chunk = CStr::from_ptr(ptr)
-                    .to_str()
-                    .map_err(|_| anyhow!("espeak-ng returned non-UTF-8 phonemes"))?
-                    .trim()
-                    .to_owned();
-                if !chunk.is_empty() { parts.push(chunk); }
-            }
+        if text.is_empty() {
+            return Ok(String::new());
         }
-        Ok(parts.join(" "))
+
+        let engine = create_engine(lang)?;
+        let ipa = engine
+            .text_to_phonemes(text)
+            .map_err(|e| anyhow!("espeak-ng phonemise failed: {}", e))?;
+
+        Ok(ipa.trim().to_owned())
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_phonemize_lang(lang: &str, text: &str) -> Result<String> {
+        run_phonemize(text, lang)
     }
 }
 
@@ -242,5 +208,186 @@ mod tests {
     fn test_french_no_dashes() {
         let ipa = phonemize("bonjour", "fr-fr").expect("phonemize failed");
         assert!(!ipa.contains('-'), "French output should have dashes stripped: {ipa}");
+    }
+
+    #[test]
+    fn test_german() {
+        let ipa = phonemize("Hallo Welt", "de").expect("phonemize failed");
+        assert!(!ipa.is_empty(), "expected non-empty IPA for German");
+        println!("IPA (de): {ipa}");
+    }
+
+    #[test]
+    fn test_spanish() {
+        let ipa = phonemize("Hola mundo", "es").expect("phonemize failed");
+        assert!(!ipa.is_empty(), "expected non-empty IPA for Spanish");
+        println!("IPA (es): {ipa}");
+    }
+
+    #[test]
+    fn test_all_bundled_languages() {
+        let sample_texts: &[(&str, &str)] = &[
+            ("af", "Hallo wêreld"),
+            ("am", "ሰላም ዓለም"),
+            ("an", "Hola mundo"),
+            ("ar", "مرحبا بالعالم"),
+            ("as", "নমস্কাৰ পৃথিৱী"),
+            ("az", "Salam dünya"),
+            ("ba", "Сәләм донъя"),
+            ("be", "Прывітанне свет"),
+            ("bg", "Здравей свят"),
+            ("bn", "হ্যালো বিশ্ব"),
+            ("bpy", "হ্যালো বিশ্ব"),
+            ("bs", "Zdravo svijete"),
+            ("ca", "Hola món"),
+            ("chr", "ᎣᏏᏲ ᎡᎶᎯ"),
+            ("cmn", "你好世界"),
+            ("cs", "Ahoj světe"),
+            ("cv", "Салам тĕнче"),
+            ("cy", "Helo byd"),
+            ("da", "Hej verden"),
+            ("de", "Hallo Welt"),
+            ("el", "Γεια σου κόσμε"),
+            ("en", "Hello world"),
+            ("eo", "Saluton mondo"),
+            ("es", "Hola mundo"),
+            ("et", "Tere maailm"),
+            ("eu", "Kaixo mundua"),
+            ("fa", "سلام دنیا"),
+            ("fi", "Hei maailma"),
+            ("fr", "Bonjour le monde"),
+            ("ga", "Dia duit a dhomhan"),
+            ("gd", "Halò a shaoghail"),
+            ("gn", "Mba eichaporã"),
+            ("grc", "Χαῖρε κόσμε"),
+            ("gu", "હેલો વિશ્વ"),
+            ("hak", "你好世界"),
+            ("haw", "Aloha honua"),
+            ("he", "שלום עולם"),
+            ("hi", "नमस्ते दुनिया"),
+            ("hr", "Pozdrav svijete"),
+            ("ht", "Bonjou mond"),
+            ("hu", "Helló világ"),
+            ("hy", "Բարdelays աdelays"),
+            ("ia", "Salute mundo"),
+            ("id", "Halo dunia"),
+            ("io", "Saluto mondo"),
+            ("is", "Halló heimur"),
+            ("it", "Ciao mondo"),
+            ("ja", "こんにちは世界"),
+            ("jbo", "coi rodo"),
+            ("ka", "გამარჯობა მსოფლიო"),
+            ("kk", "Сәлем әлем"),
+            ("kl", "Aluu nunarsuaq"),
+            ("kn", "ಹಲೋ ಪ್ರಪಂಚ"),
+            ("ko", "안녕하세요 세계"),
+            ("kok", "नमस्कार जग"),
+            ("ku", "Silav cîhan"),
+            ("ky", "Салам дүйнө"),
+            ("la", "Salve munde"),
+            ("lb", "Moien Welt"),
+            ("lfn", "Bon dia mundo"),
+            ("lt", "Sveikas pasauli"),
+            ("lv", "Sveika pasaule"),
+            ("mi", "Kia ora te ao"),
+            ("mk", "Здраво свету"),
+            ("ml", "ഹലോ ലോകം"),
+            ("mr", "नमस्कार जग"),
+            ("ms", "Helo dunia"),
+            ("mt", "Bongu dinja"),
+            ("mto", "Hola mundo"),
+            ("my", "မင်္ဂလာပါ ကမ္ဘာ"),
+            ("nci", "Niltze cemanahuac"),
+            ("ne", "नमस्ते संसार"),
+            ("nl", "Hallo wereld"),
+            ("no", "Hei verden"),
+            ("nog", "Салам дуныя"),
+            ("om", "Akkam addunyaa"),
+            ("or", "ନମସ୍କାର ବିଶ୍ୱ"),
+            ("pa", "ਸਤ ਸ੍ਰੀ ਅਕਾਲ ਦੁਨੀਆ"),
+            ("pap", "Bon dia mundo"),
+            ("piqd", "nuqneH"),
+            ("pl", "Witaj świecie"),
+            ("pt", "Olá mundo"),
+            ("py", "Hello world"),
+            ("qdb", "Hello world"),
+            ("qu", "Napaykullayki llaqta"),
+            ("quc", "Saqarik uwachulew"),
+            ("qya", "Aiya Arda"),
+            ("ro", "Salut lume"),
+            ("ru", "Привет мир"),
+            ("sd", "هيلو دنيا"),
+            ("shn", "မႂ်ႇသုင်ႇ လူၵ်ႈ"),
+            ("si", "හෙලෝ ලෝකය"),
+            ("sjn", "Mae govannen"),
+            ("sk", "Ahoj svet"),
+            ("sl", "Pozdravljen svet"),
+            ("smj", "Buorre beaivi"),
+            ("sq", "Përshëndetje botë"),
+            ("sr", "Здраво свете"),
+            ("sv", "Hej världen"),
+            ("sw", "Habari dunia"),
+            ("ta", "வணக்கம் உலகம்"),
+            ("te", "హలో ప్రపంచం"),
+            ("th", "สวัสดีชาวโลก"),
+            ("ti", "ሰላም ዓለም"),
+            ("tk", "Salam dünýä"),
+            ("tn", "Dumela lefatshe"),
+            ("tr", "Merhaba dünya"),
+            ("tt", "Сәлам дөнья"),
+            ("ug", "ياخشىمۇسىز دۇنيا"),
+            ("uk", "Привіт світ"),
+            ("ur", "ہیلو دنیا"),
+            ("uz", "Salom dunyo"),
+            ("vi", "Xin chào thế giới"),
+            ("yue", "你好世界"),
+        ];
+
+        // Languages whose phoneme tables are missing in espeak-ng 0.1.0.
+        let known_missing: &[&str] = &["bs", "io", "lfn", "pap"];
+
+        let mut passed = 0;
+        let mut empty = Vec::new();
+        let mut failed = Vec::new();
+        let mut skipped = Vec::new();
+
+        for &(lang, text) in sample_texts {
+            match inner::run_phonemize_lang(lang, text) {
+                Ok(ipa) if ipa.is_empty() => {
+                    println!("  {lang:>5}: {text:30} → (empty)");
+                    empty.push(lang);
+                    passed += 1;
+                }
+                Ok(ipa) => {
+                    println!("  {lang:>5}: {text:30} → {ipa}");
+                    passed += 1;
+                }
+                Err(e) if known_missing.contains(&lang) => {
+                    println!("  {lang:>5}: SKIPPED (known missing) — {e}");
+                    skipped.push(lang);
+                }
+                Err(e) => {
+                    eprintln!("  {lang:>5}: FAILED — {e}");
+                    failed.push((lang, format!("{e}")));
+                }
+            }
+        }
+
+        let total = sample_texts.len();
+        println!("\n{passed}/{total} languages succeeded, {} skipped (known missing)",
+            skipped.len());
+        if !empty.is_empty() {
+            println!("{} languages returned empty IPA: {:?}", empty.len(), empty);
+        }
+        if !failed.is_empty() {
+            println!("Unexpected failures:");
+            for (lang, err) in &failed {
+                println!("  {lang}: {err}");
+            }
+            panic!(
+                "{} out of {total} languages had unexpected failures",
+                failed.len(),
+            );
+        }
     }
 }

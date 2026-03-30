@@ -39,7 +39,7 @@
 //! | Feature    | Default | Effect                                                                       |
 //! |------------|---------|------------------------------------------------------------------------------|
 //! | `backbone` | ✓       | GGUF backbone via llama-cpp-4 (requires cmake + C++)                         |
-//! | `espeak`   |         | Raw-text input via libespeak-ng                                              |
+//! | `espeak`   |         | Raw-text input via pure-Rust espeak-ng (114 bundled languages, no system deps) |
 //! | `wgpu`     |         | GPU-accelerated codec via Burn wgpu; falls back to Burn NdArray then ndarray |
 //! | `metal`    |         | macOS Metal GPU for the backbone (passed to llama-cpp-4)                     |
 //! | `cuda`     |         | NVIDIA CUDA for the backbone (passed to llama-cpp-4)                         |

@@ -58,10 +58,10 @@ fn to_c_str(s: &str) -> *const c_char {
 
 // ─── Public C API ─────────────────────────────────────────────────────────────
 
-/// Set the `espeak-ng-data/` directory path.
+/// Set the espeak-ng data directory path.
 ///
-/// **Must be called once at app startup on iOS / Android before any synthesis.**
-/// Pass `NULL` on desktop (auto-detection).
+/// With the pure-Rust `espeak-ng` crate and bundled data, this is **optional**.
+/// Only needed if you want to override the bundled data with custom dictionaries.
 ///
 /// ```c
 /// neutts_set_espeak_data_path("/var/mobile/…/espeak-ng-data");

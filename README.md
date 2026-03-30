@@ -1,6 +1,6 @@
 # neutts-rs
 
-[![Version](https://img.shields.io/badge/version-0.0.7-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](CHANGELOG.md)
 
 Rust port of [NeuTTS](https://github.com/neuphonic/neutts) — on-device voice-cloning TTS
 built on a GGUF LLM backbone and the [NeuCodec](https://huggingface.co/neuphonic/neucodec)
@@ -10,24 +10,14 @@ neural audio codec.
 The codec runs as a self-contained CPU/GPU inference engine
 (`safetensors` + `ndarray` + `rustfft`, with optional `burn`/`wgpu` GPU path).
 
+**Pure-Rust phonemisation** — the `espeak` feature uses the [`espeak-ng`](https://crates.io/crates/espeak-ng)
+crate with bundled data for all 114 languages.  No system library installation required.
+
 ---
 
 ## Quick start
 
-### 1. Install system dependencies
-
-```sh
-# macOS
-brew install espeak-ng
-
-# Ubuntu / Debian
-apt install espeak-ng
-
-# Alpine
-apk add espeak-ng
-```
-
-### 2. Convert codec weights (one-time, ~2 min)
+### 1. Convert codec weights (one-time, ~2 min)
 
 ```sh
 pip install torch huggingface_hub safetensors
@@ -37,13 +27,15 @@ python scripts/convert_weights.py
 Downloads `neuphonic/neucodec`, extracts the decoder weights, and saves them as
 `models/neucodec_decoder.safetensors`.
 
-### 3. Build
+### 2. Build
 
 ```sh
 cargo build --features espeak
 ```
 
-### 4. Clone a voice and synthesise
+No system dependencies needed — `espeak-ng` is pure Rust with bundled data.
+
+### 3. Clone a voice and synthesise
 
 The simplest path — point at any WAV file and say what you want:
 
@@ -242,20 +234,31 @@ cargo run --example speak --features espeak -- \
 
 ---
 
+## Bundled Languages (114)
+
+The `espeak` feature bundles phoneme data for all 114 espeak-ng languages:
+
+`af`, `am`, `an`, `ar`, `as`, `az`, `ba`, `be`, `bg`, `bn`, `bpy`, `bs`, `ca`, `chr`, `cmn`, `cs`, `cv`, `cy`, `da`, `de`, `el`, `en`, `eo`, `es`, `et`, `eu`, `fa`, `fi`, `fr`, `ga`, `gd`, `gn`, `grc`, `gu`, `hak`, `haw`, `he`, `hi`, `hr`, `ht`, `hu`, `hy`, `ia`, `id`, `io`, `is`, `it`, `ja`, `jbo`, `ka`, `kk`, `kl`, `kn`, `ko`, `kok`, `ku`, `ky`, `la`, `lb`, `lfn`, `lt`, `lv`, `mi`, `mk`, `ml`, `mr`, `ms`, `mt`, `mto`, `my`, `nci`, `ne`, `nl`, `no`, `nog`, `om`, `or`, `pa`, `pap`, `piqd`, `pl`, `pt`, `py`, `qdb`, `qu`, `quc`, `qya`, `ro`, `ru`, `sd`, `shn`, `si`, `sjn`, `sk`, `sl`, `smj`, `sq`, `sr`, `sv`, `sw`, `ta`, `te`, `th`, `ti`, `tk`, `tn`, `tr`, `tt`, `ug`, `uk`, `ur`, `uz`, `vi`, `yue`
+
+> **Note**: 4 languages (`bs`, `io`, `lfn`, `pap`) have missing phoneme tables in `espeak-ng` 0.1.0.
+> 17 languages with non-Latin scripts may return empty IPA for some inputs (upstream limitation).
+
+---
+
 ## Architecture
 
 ```
-text ──► espeak-ng ──► IPA ──┐
-                              ├──► prompt builder ──► GGUF backbone ──► speech tokens
-ref_codes (.npy) ─────────────┘                          (llama-cpp-4)        │
-                                                                               ▼
-                                                                   NeuCodec decoder
-                                                              (Burn wgpu GPU  ──or──
-                                                               Burn NdArray CPU ──or──
-                                                               raw ndarray CPU)
-                                                                               │
-                                                                               ▼
-                                                                   audio (Vec<f32>, 24 kHz)
+text ──► espeak-ng (pure Rust) ──► IPA ──┐
+                                          ├──► prompt builder ──► GGUF backbone ──► speech tokens
+ref_codes (.npy) ─────────────────────────┘                          (llama-cpp-4)        │
+                                                                                           ▼
+                                                                               NeuCodec decoder
+                                                                          (Burn wgpu GPU  ──or──
+                                                                           Burn NdArray CPU ──or──
+                                                                           raw ndarray CPU)
+                                                                                           │
+                                                                                           ▼
+                                                                               audio (Vec<f32>, 24 kHz)
 ```
 
 ### GGUF backbone
@@ -322,7 +325,7 @@ Each has a `.wav` (original audio), `.npy` (pre-encoded tokens), and `.txt` (tra
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `backbone` | ✓ | GGUF backbone via `llama-cpp-4` (requires cmake + C++) |
-| `espeak` | | Raw-text input via `libespeak-ng` |
+| `espeak` | | Raw-text input via pure-Rust `espeak-ng` (114 bundled languages, no system deps) |
 | `wgpu` | | GPU-accelerated codec via Burn wgpu (Metal/Vulkan/DX12); auto-falls back to Burn NdArray CPU, then raw ndarray |
 | `metal` | | macOS Metal GPU for the backbone |
 | `cuda` | | NVIDIA CUDA for the backbone |
@@ -359,99 +362,40 @@ Measured on a MacBook Pro M2 with the `wgpu` feature (Metal GPU) and
 | 0.0.1 | 4.45 s | 1.79× | GPU init (1.72 s) counted against synthesis |
 | 0.0.2 | ~2.7 s | ~1.1× | GPU init moved to load time; RoPE uploads eliminated |
 
-**What changed in 0.0.2:**
-
-- **Eager GPU init** — `NeuCodecDecoder::from_file()` now initialises the Burn
-  wgpu backend immediately, moving the ~1.7 s GPU upload from synthesis latency
-  into model loading time (reported in "loaded in X s").
-- **Pre-computed RoPE tables** — cos/sin tables for up to 2048 positions are
-  computed once at weight-load time and stored as device tensors.  This
-  eliminates the 24 CPU→GPU uploads that previously occurred on every decode
-  call (12 transformer blocks × Q and K projections each).
-
 ---
 
 ## Build requirements
 
 | Platform | Backbone | Codec | Phonemizer (`espeak` feature) |
 |----------|----------|-------|-------------------------------|
-| macOS | cmake + C++ (auto) | pure Rust | `brew install espeak-ng` — or `bash scripts/build-espeak.sh` |
-| Linux | cmake + C++ (auto) | pure Rust | `apt install libespeak-ng-dev` — or `bash scripts/build-espeak.sh` |
-| Windows MSVC | cmake + MSVC (auto) | pure Rust | `.\scripts\build-espeak-windows.ps1` (see below) |
-| Windows GNU | cmake + MinGW (auto) | pure Rust | `bash scripts/build-espeak.sh` (WSL or Git Bash) |
-| iOS / Android | cross-compile llama.cpp | pure Rust | Cross-compile espeak-ng; set `ESPEAK_LIB_DIR` |
+| All | cmake + C++ (auto) | pure Rust | **None** — pure Rust with bundled data |
 
-### Windows (MSVC) — quick start
+The `espeak` feature requires zero system dependencies.  The `backbone` feature
+requires cmake + a C++ compiler for llama.cpp.
 
-```powershell
-# Prerequisites (one-time):
-winget install Kitware.CMake Git.Git LLVM.LLVM Ninja-build.Ninja
+### Cross-platform builds
 
-# From a "Developer PowerShell for VS 2022":
-.\scripts\build-espeak-windows.ps1
+Since phonemisation is now pure Rust, cross-compilation is straightforward:
 
-# Build:
-$env:ESPEAK_LIB_DIR = "espeak-static\lib"
-cargo build --features espeak
-```
+```sh
+# iOS
+rustup target add aarch64-apple-ios
+cargo build --target aarch64-apple-ios --features espeak
 
-The PowerShell script builds espeak-ng from source into `espeak-static\lib\espeak-ng-merged.lib`
-and copies the language data to `espeak-static\share\espeak-ng-data\`.
+# Android
+rustup target add aarch64-linux-android
+cargo build --target aarch64-linux-android --features espeak
 
-**Path-length note:** if your project tree is deeply nested, pass `-BuildRoot C:\es` to use a
-short build directory and avoid Windows MAX\_PATH issues:
+# Linux aarch64
+rustup target add aarch64-unknown-linux-gnu
+cargo build --target aarch64-unknown-linux-gnu --features espeak
 
-```powershell
-.\scripts\build-espeak-windows.ps1 -BuildRoot C:\es
-```
-
-Alternatively, set `ESPEAK_BUILD_DIR=C:\es` before `cargo build` and the build script will use
-that directory automatically.
-
-### Cross-compiling Linux/macOS → Windows x86\_64-pc-windows-gnu
-
-**Option A — MinGW-w64** (Ubuntu / Debian / macOS):
-
-```bash
-# Install MinGW-w64 cross-compiler:
-#   Ubuntu:  sudo apt install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
-#   macOS:   brew install mingw-w64
-
-# Build espeak-ng for Windows-GNU target:
-CROSS_TARGET=x86_64-w64-mingw32 bash scripts/build-espeak.sh
-
-# Add the Rust target and build:
+# Windows (from any host)
 rustup target add x86_64-pc-windows-gnu
-ESPEAK_LIB_DIR=espeak-static/lib \
-CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
 cargo build --target x86_64-pc-windows-gnu --features espeak
 ```
 
-**Option B — Zig as cross-compiler** (Alpine Linux / any host with Zig):
-
-When MinGW-w64 is unavailable (e.g. Alpine Linux), Zig ships a built-in
-`x86_64-windows-gnu` cross-compiler that can substitute:
-
-```bash
-# Install Zig (0.12+)
-# Alpine: apk add zig
-# Others: https://ziglang.org/download/
-
-# Create thin wrapper scripts so cc-rs can find the MinGW triple:
-cat > /usr/local/bin/x86_64-w64-mingw32-gcc << 'EOF'
-#!/bin/sh
-args=$(printf '%s\n' "$@" | grep -v -- '--target=x86_64-pc-windows-gnu')
-exec zig cc -target x86_64-windows-gnu $args
-EOF
-chmod +x /usr/local/bin/x86_64-w64-mingw32-gcc
-
-# Codec-only build (no espeak / cmake required):
-rustup target add x86_64-pc-windows-gnu
-cargo build --target x86_64-pc-windows-gnu --no-default-features --features fast --release
-# → target/x86_64-pc-windows-gnu/release/libneutts.a  (PE/COFF x86-64)
-```
-
-See `.cargo/config.toml` for the pre-wired linker/ar configuration.
+No `ESPEAK_LIB_DIR`, no sysroot, no cross-compiled C library needed.
 
 ---
 
@@ -603,11 +547,26 @@ See [`include/neutts.h`](include/neutts.h) for the full C header.
 ## Pipeline stages
 
 1. **Text preprocessing** — numbers, currencies, abbreviations → spoken words
-2. **Phonemisation** — espeak-ng converts text to IPA phonemes
+2. **Phonemisation** — pure-Rust espeak-ng converts text to IPA phonemes
 3. **Prompt construction** — reference codes + IPA → GGUF prompt
 4. **Backbone inference** — GGUF LLM generates `<|speech_N|>` tokens
 5. **Token extraction** — regex extracts integer IDs from generated text
 6. **Codec decode** — NeuCodec decoder converts IDs to 24 kHz audio
+
+---
+
+## Migration from C `libespeak-ng`
+
+This crate previously used C FFI bindings to `libespeak-ng` with a 749-line
+`build.rs` for native library detection and cross-compilation. It now uses the
+pure-Rust [`espeak-ng`](https://crates.io/crates/espeak-ng) crate instead:
+
+- **No system library required** — `brew install espeak-ng` / `apt install libespeak-ng-dev` no longer needed
+- **No C compiler needed** for phonemisation — no `cmake`, no `gcc`, no build scripts
+- **No unsafe code** in phonemisation — the entire FFI layer was removed
+- **build.rs reduced from 749 lines to 48** — only RoPE checks and weight detection remain
+- **Cross-compilation just works** — no `ESPEAK_LIB_DIR`, no `ESPEAK_SYSROOT`, no NDK toolchain setup
+- **114 languages bundled** — all espeak-ng languages ship as embedded data
 
 ---
 
@@ -621,11 +580,12 @@ See [`include/neutts.h`](include/neutts.h) for the full C header.
 | GPU-accelerated codec (`wgpu` feature) | ✅ Metal / Vulkan / DX12 via Burn |
 | Streaming backbone API (`generate_streaming`) | ✅ |
 | Streaming PCM output (`stream_pcm` example) | ✅ |
+| Pure-Rust phonemisation (114 languages) | ✅ |
 | English backbones (Nano / Air, Q4 / Q8) | ✅ |
 | German / French / Spanish backbones | ✅ |
-| Windows cross-compilation (Zig or MinGW-w64) | ✅ |
-| Test suite (unit + integration + e2e) | ✅ 106 tests, no model files required |
-| iOS / Android build | ✅ codec is pure Rust; backbone needs cross-compile |
+| Cross-platform builds | ✅ No native espeak deps |
+| Test suite (unit + integration + e2e) | ✅ 114 tests |
+| iOS / Android build | ✅ codec + phonemiser are pure Rust; backbone needs cross-compile |
 
 ---
 
@@ -639,7 +599,7 @@ If you use this software in your research or project, please cite it as:
   title        = {{neutts}: Rust port of {NeuTTS} — on-device voice-cloning {TTS}
                   with {GGUF} backbone and {NeuCodec} decoder},
   year         = {2026},
-  version      = {0.0.7},
+  version      = {0.1.0},
   license      = {MIT},
   url          = {https://github.com/eugenehp/neutts-rs}
 }
